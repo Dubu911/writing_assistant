@@ -1,0 +1,7 @@
+context/
+context.enc/
+.env
+node_modules/
+__pycache__/
+*.pyc
+dist/
