@@ -3,33 +3,33 @@ import { checkStatus, analyzeText } from './api'
 import { getAllModes, getModeById, assembleMode } from './modes'
 import SetupScreen from './components/SetupScreen'
 import Editor from './components/Editor'
-import FeedbackBubble from './components/FeedbackBubble'
+import FeedbackPanel from './components/FeedbackPanel'
 import ModeEditor from './components/ModeEditor'
 import './App.css'
 
-const CHAR_THRESHOLD  = 150    // new characters typed since last analysis (~30-40s for an average typist)
-const TIMER_INTERVAL  = 20000  // 20 seconds
-const COOLDOWN_MS     = 15000  // min gap between API calls — keeps us under gemini-3.5-flash's 5 RPM free tier
+function defaultFocusBand() {
+  const h = window.innerHeight
+  return { top: Math.round(h * 0.20), bottom: Math.round(h * 0.70) }
+}
 
 export default function App() {
-  const [configured, setConfigured]     = useState(null)
-  const [allModes, setAllModes]         = useState(getAllModes)
-  const [activeModeId, setActiveModeId] = useState('basic')
-  const [triggerMode, setTriggerMode]   = useState('auto') // 'auto' | 'manual'
-  const [issues, setIssues]             = useState([])
-  const [activeBubble, setActiveBubble] = useState(null)
-  const [isAnalyzing, setIsAnalyzing]   = useState(false)
-  const [apiError, setApiError]         = useState(null)
-  const [showEditor, setShowEditor]     = useState(false)
+  const [configured, setConfigured]       = useState(null)
+  const [allModes, setAllModes]           = useState(getAllModes)
+  const [activeModeId, setActiveModeId]   = useState('basic')
+  const [feedbackMode, setFeedbackMode]   = useState('line')  // 'line' | 'structure'
+  const [issues, setIssues]               = useState([])
+  const [hoveredIssueId, setHoveredIssueId] = useState(null)
+  const [selectedIssueId, setSelectedIssueId] = useState(null)
+  const [isAnalyzing, setIsAnalyzing]     = useState(false)
+  const [apiError, setApiError]           = useState(null)
+  const [showEditor, setShowEditor]       = useState(false)
+  const [focusBand, setFocusBand]         = useState(() => defaultFocusBand())
 
-  const editorRef          = useRef(null)
-  const issueMapRef        = useRef({})
-  const textRef            = useRef('')
-  const modeRef            = useRef(assembleMode(getModeById('basic')))
-  const abortRef           = useRef(null)
-  const cooldownRef        = useRef(null)
-  const lastCalledRef      = useRef(0)
-  const lastAnalyzedTextRef = useRef('') // text at the time of the last analysis
+  const editorRef   = useRef(null)
+  const panelRef    = useRef(null)
+  const textRef     = useRef('')
+  const modeRef     = useRef(assembleMode(getModeById('basic')))
+  const abortRef    = useRef(null)
 
   useEffect(() => {
     const mode = getModeById(activeModeId)
@@ -37,27 +37,54 @@ export default function App() {
   }, [activeModeId, allModes])
 
   useEffect(() => {
-    issueMapRef.current = Object.fromEntries(issues.map((i) => [i.id, i]))
-  }, [issues])
-
-  useEffect(() => {
     checkStatus().then(({ configured }) => setConfigured(configured))
   }, [])
 
-  // ── Analysis ──────────────────────────────────────────────────────────────────
+  // Keep focus band valid across window resizes
+  useEffect(() => {
+    function onResize() {
+      setFocusBand((b) => {
+        const h = window.innerHeight
+        return {
+          top: Math.min(b.top, h - 80),
+          bottom: Math.min(b.bottom, h - 20),
+        }
+      })
+    }
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
 
-  const doAnalysis = useCallback((text) => {
+  // ── Analysis ──────────────────────────────────────────────────────────────
+  const runAnalysis = useCallback(() => {
+    const snap = editorRef.current?.captureSnapshot()
+    if (!snap || !snap.target.trim()) {
+      setApiError(
+        feedbackMode === 'structure'
+          ? 'Select some text first, then press Shift+Enter.'
+          : 'Move the focus band over some text first.',
+      )
+      return
+    }
     if (abortRef.current) abortRef.current.abort()
-    if (!text.trim()) { setIssues([]); return }
-
-    const { instructions, types } = modeRef.current
     const ctrl = new AbortController()
     abortRef.current = ctrl
+
+    const { instructions, types } = modeRef.current
     setIsAnalyzing(true)
     setApiError(null)
-    lastAnalyzedTextRef.current = text  // mark what we're about to analyze
 
-    analyzeText(text, instructions, types, ctrl.signal)
+    analyzeText(
+      {
+        target: snap.target,
+        context_before: snap.context_before,
+        context_after: snap.context_after,
+        mode: feedbackMode,
+        instructions: feedbackMode === 'line' ? instructions : '',
+        types: feedbackMode === 'line' ? types : [],
+      },
+      ctrl.signal,
+    )
       .then(({ issues: found }) => { if (!ctrl.signal.aborted) setIssues(found) })
       .catch((e) => {
         if (e.name === 'AbortError') return
@@ -65,61 +92,32 @@ export default function App() {
         if (!ctrl.signal.aborted) setApiError(e.message || 'Analysis failed')
       })
       .finally(() => { if (!ctrl.signal.aborted) setIsAnalyzing(false) })
-  }, [])
+  }, [feedbackMode])
 
-  // Rate-limited: queues the call if within cooldown, never drops it
-  const runAnalysis = useCallback((text) => {
-    if (cooldownRef.current) clearTimeout(cooldownRef.current)
-    const wait = COOLDOWN_MS - (Date.now() - lastCalledRef.current)
-    if (wait <= 0) {
-      lastCalledRef.current = Date.now()
-      doAnalysis(text)
-    } else {
-      cooldownRef.current = setTimeout(() => {
-        lastCalledRef.current = Date.now()
-        doAnalysis(textRef.current)
-      }, wait)
-    }
-  }, [doAnalysis])
-
-  // Re-analyze immediately when the user switches mode
+  // Shift+Enter triggers analyze from anywhere
   useEffect(() => {
-    if (textRef.current.trim()) runAnalysis(textRef.current)
-  }, [activeModeId, runAnalysis])
-
-  // 20-second timer trigger (auto mode only)
-  useEffect(() => {
-    if (triggerMode !== 'auto') return
-    const interval = setInterval(() => {
-      const text = textRef.current
-      if (text.trim() && text !== lastAnalyzedTextRef.current) {
-        runAnalysis(text)
+    function onKey(e) {
+      if (e.key === 'Enter' && e.shiftKey) {
+        e.preventDefault()
+        runAnalysis()
       }
-    }, TIMER_INTERVAL)
-    return () => clearInterval(interval)
-  }, [triggerMode, runAnalysis])
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [runAnalysis])
 
-  // ── Event handlers ────────────────────────────────────────────────────────────
-
+  // ── Event handlers ────────────────────────────────────────────────────────
   const handleTextChange = useCallback((text) => {
     textRef.current = text
-    setActiveBubble(null)
-
-    // Character-count trigger (auto mode only) — only counts additions, not deletions
-    if (triggerMode !== 'auto' || !text.trim()) return
-    const added = text.length - lastAnalyzedTextRef.current.length
-    if (added >= CHAR_THRESHOLD) runAnalysis(text)
-  }, [triggerMode, runAnalysis])
-
-  const handleIssueClick = useCallback((issueId, anchorRect) => {
-    const issue = issueMapRef.current[issueId]
-    if (issue) setActiveBubble({ issue, anchorRect })
   }, [])
 
   const handleApply = useCallback((issueText, suggestion) => {
     editorRef.current?.applyFix(issueText, suggestion)
-    setActiveBubble(null)
     setIssues((prev) => prev.filter((i) => i.text !== issueText))
+  }, [])
+
+  const handleIssueClick = useCallback((issueId) => {
+    setSelectedIssueId((prev) => (prev === issueId ? null : issueId))
   }, [])
 
   function handleModeSelect(id) {
@@ -127,8 +125,7 @@ export default function App() {
     setActiveModeId(id)
   }
 
-  // ── Render ────────────────────────────────────────────────────────────────────
-
+  // ── Render ────────────────────────────────────────────────────────────────
   if (configured === null) return <div className="loading">Loading…</div>
   if (!configured) return <SetupScreen onComplete={() => setConfigured(true)} />
 
@@ -137,48 +134,49 @@ export default function App() {
       <header className="app-header">
         <span className="app-title">Writing Assistant</span>
 
-        <div className="mode-selector">
-          {allModes.map((m) => (
-            <button
-              key={m.id}
-              className={`mode-btn ${m.id === activeModeId ? 'active' : ''}`}
-              onClick={() => setActiveModeId(m.id)}
-              title={m.checks.filter(c => c.enabled).map(c => c.label).join(', ')}
-            >
-              {m.name}
+        <div className="feedback-mode-toggle">
+          <button
+            className={`fm-btn ${feedbackMode === 'line' ? 'active' : ''}`}
+            onClick={() => setFeedbackMode('line')}
+            title="Sentence-level feedback within the focus band"
+          >
+            Line
+          </button>
+          <button
+            className={`fm-btn ${feedbackMode === 'structure' ? 'active' : ''}`}
+            onClick={() => setFeedbackMode('structure')}
+            title="Structural feedback on selected text"
+          >
+            Structure
+          </button>
+        </div>
+
+        {feedbackMode === 'line' && (
+          <div className="mode-selector">
+            {allModes.map((m) => (
+              <button
+                key={m.id}
+                className={`mode-btn ${m.id === activeModeId ? 'active' : ''}`}
+                onClick={() => setActiveModeId(m.id)}
+                title={m.checks.filter(c => c.enabled).map(c => c.label).join(', ')}
+              >
+                {m.name}
+              </button>
+            ))}
+            <button className="mode-edit-btn" onClick={() => setShowEditor(true)} title="Manage modes">
+              ⚙
             </button>
-          ))}
-          <button className="mode-edit-btn" onClick={() => setShowEditor(true)} title="Manage modes">
-            ⚙
-          </button>
-        </div>
-
-        <div className="trigger-selector">
-          <button
-            className={`trigger-btn ${triggerMode === 'auto' ? 'active' : ''}`}
-            onClick={() => setTriggerMode('auto')}
-            title="Analyze every 20 seconds or every 10 new words"
-          >
-            Auto
-          </button>
-          <button
-            className={`trigger-btn ${triggerMode === 'manual' ? 'active' : ''}`}
-            onClick={() => setTriggerMode('manual')}
-            title="Analyze only when you click the button"
-          >
-            Manual
-          </button>
-        </div>
-
-        {triggerMode === 'manual' && (
-          <button
-            className="analyze-btn"
-            onClick={() => runAnalysis(textRef.current)}
-            disabled={isAnalyzing}
-          >
-            {isAnalyzing ? 'Analyzing…' : 'Analyze'}
-          </button>
+          </div>
         )}
+
+        <button
+          className="analyze-btn"
+          onClick={runAnalysis}
+          disabled={isAnalyzing}
+          title="Shift+Enter"
+        >
+          {isAnalyzing ? 'Analyzing…' : 'Analyze (⇧↵)'}
+        </button>
 
         <span className="status-label">
           {apiError
@@ -191,23 +189,31 @@ export default function App() {
         </span>
       </header>
 
-      <main className="editor-container">
-        <Editor
-          ref={editorRef}
+      <main className="workspace">
+        <div className="editor-column">
+          <Editor
+            ref={editorRef}
+            issues={issues}
+            mode={feedbackMode}
+            focusBand={focusBand}
+            onFocusBandChange={setFocusBand}
+            onTextChange={handleTextChange}
+            onIssueClick={handleIssueClick}
+            onIssueHover={setHoveredIssueId}
+            hoveredIssueId={hoveredIssueId}
+            selectedIssueId={selectedIssueId}
+          />
+        </div>
+        <FeedbackPanel
+          panelRef={panelRef}
           issues={issues}
-          onTextChange={handleTextChange}
-          onIssueClick={handleIssueClick}
+          hoveredIssueId={hoveredIssueId}
+          selectedIssueId={selectedIssueId}
+          onHover={setHoveredIssueId}
+          onSelect={setSelectedIssueId}
+          onApply={handleApply}
         />
       </main>
-
-      {activeBubble && (
-        <FeedbackBubble
-          issue={activeBubble.issue}
-          anchorRect={activeBubble.anchorRect}
-          onApply={handleApply}
-          onDismiss={() => setActiveBubble(null)}
-        />
-      )}
 
       {showEditor && (
         <ModeEditor

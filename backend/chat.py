@@ -28,7 +28,7 @@ def send_message(session_id: str, message: str, context: dict) -> str:
 
     if session_id not in _sessions:
         _sessions[session_id] = client.chats.create(
-            model="gemini-3.5-flash",
+            model="gemini-2.5-flash",
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT.format(
                     issue_text=context.get("issue_text", ""),

@@ -3,10 +3,13 @@
 
 body {
   font-family: 'Georgia', Georgia, serif;
-  background: #f0f0eb;
+  background: #f4f4f1;
   color: #1a1a1a;
   height: 100vh;
+  overflow: hidden;
 }
+
+body.focus-dragging { cursor: ns-resize; user-select: none; }
 
 /* ── App shell ─────────────────────────────────────────────────────────────── */
 .app { display: flex; flex-direction: column; height: 100vh; }
@@ -15,19 +18,39 @@ body {
 .app-header {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   padding: 10px 20px;
   background: white;
   border-bottom: 1px solid #e4e4e4;
   font-family: system-ui, sans-serif;
   position: relative;
-  z-index: 10;
+  z-index: 50;
+  flex-shrink: 0;
 }
 
 .app-title { font-weight: 600; font-size: 15px; margin-right: auto; }
 
-.mode-selector { display: flex; gap: 4px; }
+/* feedback-mode toggle (Line / Structure) */
+.feedback-mode-toggle {
+  display: flex;
+  border: 1px solid #1a1a1a;
+  border-radius: 20px;
+  overflow: hidden;
+}
+.fm-btn {
+  padding: 4px 14px;
+  border: none;
+  background: white;
+  cursor: pointer;
+  font-size: 13px;
+  color: #1a1a1a;
+  font-weight: 500;
+}
+.fm-btn:first-child { border-right: 1px solid #1a1a1a; }
+.fm-btn.active { background: #1a1a1a; color: white; }
+.fm-btn:hover:not(.active) { background: #f5f5f5; }
 
+.mode-selector { display: flex; gap: 4px; }
 .mode-btn {
   padding: 4px 14px;
   border: 1px solid #ccc;
@@ -41,7 +64,6 @@ body {
 .mode-btn.active  { background: #1a1a1a; color: white; border-color: #1a1a1a; }
 .mode-btn:hover:not(.active) { background: #f5f5f5; }
 
-/* ── Mode edit button ──────────────────────────────────────────────────────── */
 .mode-edit-btn {
   padding: 4px 10px;
   border: 1px solid #ddd;
@@ -50,25 +72,8 @@ body {
   cursor: pointer;
   font-size: 14px;
   color: #888;
-  transition: color 0.15s, border-color 0.15s;
 }
 .mode-edit-btn:hover { color: #333; border-color: #999; }
-
-/* ── Trigger toggle ────────────────────────────────────────────────────────── */
-.trigger-selector { display: flex; gap: 0; border: 1px solid #ccc; border-radius: 20px; overflow: hidden; }
-
-.trigger-btn {
-  padding: 4px 12px;
-  border: none;
-  background: white;
-  cursor: pointer;
-  font-size: 13px;
-  color: #555;
-  transition: background 0.15s, color 0.15s;
-}
-.trigger-btn:first-child { border-right: 1px solid #ccc; }
-.trigger-btn.active { background: #1a1a1a; color: white; }
-.trigger-btn:hover:not(.active) { background: #f5f5f5; }
 
 .analyze-btn {
   padding: 5px 16px;
@@ -87,19 +92,31 @@ body {
 .status-label { font-size: 12px; color: #888; min-width: 80px; text-align: right; }
 .status-error { color: #e53935; font-size: 12px; cursor: help; }
 
-/* ── Editor area ───────────────────────────────────────────────────────────── */
-.editor-container {
+/* ── Workspace (editor + right panel) ─────────────────────────────────────── */
+.workspace {
   flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  min-height: 0;
+}
+
+.editor-column {
   display: flex;
   justify-content: center;
   padding: 48px 20px 80px;
   overflow-y: auto;
+  background: #f4f4f1;
+}
+
+.editor-wrap {
+  width: 100%;
+  max-width: 760px;
+  position: relative;
 }
 
 .editor {
   width: 100%;
-  max-width: 720px;
-  min-height: 480px;
+  min-height: calc(100vh - 200px);
   padding: 52px 60px;
   background: white;
   border-radius: 4px;
@@ -107,16 +124,38 @@ body {
   font-size: 18px;
   line-height: 1.85;
   outline: none;
-  white-space: pre-wrap;
   word-wrap: break-word;
   cursor: text;
 }
+
+.editor p { margin: 0 0 1em 0; }
+.editor p:last-child { margin-bottom: 0; }
 
 .editor:empty::before {
   content: attr(data-placeholder);
   color: #c0c0c0;
   pointer-events: none;
 }
+
+/* ── Focus band (pastel dotted lines, viewport-fixed) ─────────────────────── */
+.focus-line {
+  position: fixed;
+  left: 0;
+  right: 340px;          /* stop at the panel edge */
+  height: 0;
+  border-top: 2px dotted #f5c6c6;   /* pastel pink */
+  pointer-events: auto;
+  cursor: ns-resize;
+  z-index: 30;
+}
+.focus-line::before {
+  content: '';
+  position: absolute;
+  top: -6px; bottom: -6px;
+  left: 0; right: 0;
+}
+.focus-line-top    { border-top-color: #c9d8f5; }   /* pastel blue */
+.focus-line-bottom { border-top-color: #c9d8f5; }
 
 /* ── Issue highlights ──────────────────────────────────────────────────────── */
 mark.issue {
@@ -125,9 +164,8 @@ mark.issue {
   cursor: pointer;
   border-bottom: 2.5px solid;
   padding-bottom: 1px;
+  transition: background 0.12s;
 }
-
-/* Known types get specific colors; unknown custom types fall back to gray */
 mark.issue             { border-color: #888;    background: rgba(136,136,136,0.06); }
 mark.issue-grammar     { border-color: #e53935; background: rgba(229,57,53,0.06); }
 mark.issue-tone        { border-color: #1976d2; background: rgba(25,118,210,0.06); }
@@ -135,144 +173,128 @@ mark.issue-clarity     { border-color: #f59e0b; background: rgba(245,158,11,0.06
 mark.issue-passive     { border-color: #7c3aed; background: rgba(124,58,237,0.06); }
 mark.issue-conciseness { border-color: #059669; background: rgba(5,150,105,0.06); }
 mark.issue-word_choice { border-color: #ea580c; background: rgba(234,88,12,0.06); }
+mark.issue-flow,
+mark.issue-pacing,
+mark.issue-organization,
+mark.issue-transition,
+mark.issue-coherence   { border-color: #6b7280; background: rgba(107,114,128,0.08); }
 
-mark.issue:hover { filter: brightness(0.95); }
+mark.issue:hover,
+mark.issue.issue-hovered { background: rgba(0,0,0,0.10); }
 
-/* ── Feedback bubble ───────────────────────────────────────────────────────── */
-.bubble {
-  background: white;
-  border-radius: 10px;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.14), 0 1px 4px rgba(0,0,0,0.08);
-  overflow: hidden;
-  font-family: system-ui, sans-serif;
-  font-size: 13px;
-  border-top: 3px solid;
+mark.issue.issue-selected {
+  background: rgba(229,57,53,0.18);
+  box-shadow: 0 0 0 2px rgba(229,57,53,0.35);
+  border-radius: 3px;
 }
 
-.bubble-grammar     { border-color: #e53935; }
-.bubble-tone        { border-color: #1976d2; }
-.bubble-clarity     { border-color: #f59e0b; }
-.bubble-passive     { border-color: #7c3aed; }
-.bubble-conciseness { border-color: #059669; }
-.bubble-word_choice { border-color: #ea580c; }
+/* ── Feedback panel (right column) ─────────────────────────────────────────── */
+.feedback-panel {
+  position: relative;
+  background: #ededea;
+  border-left: 1px solid #dcdcd6;
+  overflow-y: auto;
+  padding: 48px 0 80px 0;
+}
 
-.bubble-header {
+.feedback-empty {
+  text-align: center;
+  color: #999;
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 24px 16px;
+}
+.feedback-empty kbd {
+  background: white;
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+
+/* Cards — positioned absolutely by FeedbackPanel based on text Y */
+.fb-card {
+  background: white;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+  cursor: pointer;
+  overflow: hidden;
+  border-left: 3px solid #888;
+  font-family: system-ui, sans-serif;
+  transition: box-shadow 0.15s, transform 0.15s;
+}
+.fb-card:hover, .fb-card.fb-hovered {
+  box-shadow: 0 3px 12px rgba(0,0,0,0.12);
+  transform: translateX(-2px);
+}
+.fb-card.fb-selected {
+  box-shadow: 0 6px 20px rgba(0,0,0,0.18), 0 0 0 2px rgba(26,26,26,0.6);
+  transform: translateX(-6px) scale(1.04);
+  z-index: 5;
+  background: #fffef7;
+}
+.fb-card-grammar     { border-left-color: #e53935; }
+.fb-card-clarity     { border-left-color: #f59e0b; }
+.fb-card-tone        { border-left-color: #1976d2; }
+.fb-card-passive     { border-left-color: #7c3aed; }
+.fb-card-conciseness { border-left-color: #059669; }
+.fb-card-word_choice { border-left-color: #ea580c; }
+.fb-card-flow,
+.fb-card-pacing,
+.fb-card-organization,
+.fb-card-transition,
+.fb-card-coherence   { border-left-color: #6b7280; }
+
+.fb-flag {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 7px 12px;
-  background: #fafafa;
-  border-bottom: 1px solid #f0f0f0;
+  padding: 8px 12px;
+  font-size: 12px;
 }
-.bubble-type {
-  font-weight: 700;
-  font-size: 10px;
+.fb-type {
+  font-weight: 600;
+  font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.6px;
-  color: #666;
+  letter-spacing: 0.5px;
+  color: #555;
 }
-.bubble-close {
-  background: none;
-  border: none;
-  cursor: pointer;
-  font-size: 18px;
-  color: #aaa;
-  line-height: 1;
-  padding: 0 2px;
+.fb-chev { color: #aaa; font-size: 10px; }
+
+.fb-card.fb-expanded { cursor: default; }
+.fb-body {
+  padding: 4px 12px 12px 12px;
+  border-top: 1px solid #f0f0f0;
 }
-.bubble-close:hover { color: #333; }
+.fb-explanation {
+  font-size: 13px;
+  color: #333;
+  line-height: 1.5;
+  margin: 8px 0;
+  font-family: 'Georgia', serif;
+}
 
-.bubble-explanation { padding: 9px 12px 6px; color: #333; line-height: 1.45; }
-
-.bubble-suggestions { padding: 0 12px 10px; display: flex; flex-direction: column; gap: 5px; }
-
-.suggestion-btn {
+.fb-suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 6px;
+}
+.fb-suggestion {
   text-align: left;
-  padding: 7px 10px;
+  padding: 6px 10px;
   background: #f7f7f7;
   border: 1px solid #e4e4e4;
   border-radius: 6px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
   color: #1a1a1a;
   font-family: 'Georgia', serif;
   transition: background 0.12s, border-color 0.12s;
 }
-.suggestion-btn:hover { background: #eef4ff; border-color: #93b8f5; }
-
-.chat-toggle {
-  width: 100%;
-  padding: 7px 12px;
-  background: none;
-  border: none;
-  border-top: 1px solid #f0f0f0;
-  cursor: pointer;
-  text-align: left;
-  font-size: 12px;
-  color: #777;
-  transition: background 0.1s;
-}
-.chat-toggle:hover { background: #f9f9f9; color: #333; }
-
-/* ── Mini chat ─────────────────────────────────────────────────────────────── */
-.mini-chat { border-top: 1px solid #f0f0f0; }
-
-.chat-messages {
-  max-height: 200px;
-  overflow-y: auto;
-  padding: 8px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.chat-hint { color: #bbb; font-size: 12px; font-style: italic; }
-
-.chat-msg {
-  padding: 6px 9px;
-  border-radius: 8px;
-  line-height: 1.5;
-  font-size: 12.5px;
-  max-width: 94%;
-  white-space: pre-wrap;
-}
-.chat-msg-user      { background: #1a1a1a; color: white; align-self: flex-end; border-radius: 8px 8px 2px 8px; }
-.chat-msg-assistant { background: #f0f0f0; color: #222; align-self: flex-start; border-radius: 8px 8px 8px 2px; }
-.chat-loading       { opacity: 0.45; }
-
-.chat-input-row {
-  display: flex;
-  gap: 6px;
-  padding: 8px 12px;
-  border-top: 1px solid #f0f0f0;
-}
-.chat-input {
-  flex: 1;
-  padding: 6px 11px;
-  border: 1px solid #ddd;
-  border-radius: 20px;
-  font-size: 12.5px;
-  outline: none;
-  font-family: system-ui, sans-serif;
-}
-.chat-input:focus { border-color: #999; }
-
-.chat-send {
-  width: 30px;
-  height: 30px;
-  flex-shrink: 0;
-  border-radius: 50%;
-  background: #1a1a1a;
-  color: white;
-  border: none;
-  cursor: pointer;
-  font-size: 15px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transition: background 0.12s;
-}
-.chat-send:hover:not(:disabled) { background: #333; }
-.chat-send:disabled { opacity: 0.35; cursor: not-allowed; }
+.fb-suggestion:hover { background: #eef4ff; border-color: #93b8f5; }
 
 /* ── Setup screen ──────────────────────────────────────────────────────────── */
 .setup-screen {
@@ -322,7 +344,7 @@ mark.issue:hover { filter: brightness(0.95); }
 .setup-error { color: #e53935; font-size: 13px; margin-bottom: 10px; }
 .setup-note  { margin-top: 18px; font-size: 12px; color: #aaa; }
 
-/* ── Mode Editor Modal ─────────────────────────────────────────────────────── */
+/* ── Mode Editor Modal (unchanged) ─────────────────────────────────────────── */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -333,7 +355,6 @@ mark.issue:hover { filter: brightness(0.95); }
   z-index: 2000;
   padding: 24px;
 }
-
 .modal {
   display: flex;
   width: min(860px, 100%);
@@ -345,7 +366,6 @@ mark.issue:hover { filter: brightness(0.95); }
   font-family: system-ui, sans-serif;
 }
 
-/* Sidebar */
 .modal-sidebar {
   width: 200px;
   flex-shrink: 0;
@@ -374,7 +394,6 @@ mark.issue:hover { filter: brightness(0.95); }
   text-align: left;
   font-size: 13.5px;
   color: #444;
-  transition: background 0.1s;
 }
 .modal-mode-item:hover  { background: #efefef; }
 .modal-mode-item.active { background: white; font-weight: 600; color: #1a1a1a; border-right: 2px solid #1a1a1a; }
@@ -389,23 +408,16 @@ mark.issue:hover { filter: brightness(0.95); }
   font-size: 13px;
   color: #888;
   text-align: center;
-  transition: border-color 0.1s, color 0.1s;
 }
 .modal-add-mode:hover { border-color: #888; color: #333; }
 
-/* Main body */
 .modal-body { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-
 .modal-header {
   padding: 18px 20px 14px;
   border-bottom: 1px solid #eee;
   flex-shrink: 0;
 }
-.modal-title-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
+.modal-title-row { display: flex; align-items: center; gap: 10px; }
 .modal-mode-name { font-size: 18px; font-weight: 700; flex: 1; }
 .modal-mode-name-input {
   flex: 1;
@@ -437,7 +449,6 @@ mark.issue:hover { filter: brightness(0.95); }
   line-height: 1.4;
 }
 
-/* Small buttons */
 .btn-sm {
   padding: 5px 12px;
   border-radius: 6px;
@@ -452,7 +463,6 @@ mark.issue:hover { filter: brightness(0.95); }
 .btn-danger   { border-color: #e53935; background: white; color: #e53935; }
 .btn-danger:hover { background: #fff5f5; }
 
-/* Checks list */
 .checks-list {
   flex: 1;
   overflow-y: auto;
@@ -461,15 +471,12 @@ mark.issue:hover { filter: brightness(0.95); }
   flex-direction: column;
   gap: 10px;
 }
-
 .check-item {
   border: 1px solid #e8e8e8;
   border-radius: 8px;
   overflow: hidden;
-  transition: opacity 0.15s;
 }
 .check-item.check-disabled { opacity: 0.5; }
-
 .check-header {
   display: flex;
   align-items: center;
@@ -506,7 +513,6 @@ mark.issue:hover { filter: brightness(0.95); }
   color: #ccc;
   line-height: 1;
   padding: 0;
-  flex-shrink: 0;
 }
 .check-remove:hover { color: #e53935; }
 
@@ -526,7 +532,6 @@ mark.issue:hover { filter: brightness(0.95); }
 .check-instruction:read-only { color: #555; background: #fafafa; cursor: default; }
 .check-instruction::placeholder { color: #bbb; }
 
-/* Add check section */
 .add-check-area { padding: 12px 20px 16px; border-top: 1px solid #eee; flex-shrink: 0; }
 .btn-add-check {
   padding: 7px 16px;
@@ -536,7 +541,6 @@ mark.issue:hover { filter: brightness(0.95); }
   cursor: pointer;
   font-size: 13px;
   color: #888;
-  transition: border-color 0.1s, color 0.1s;
 }
 .btn-add-check:hover { border-color: #888; color: #333; }
 
@@ -551,7 +555,6 @@ mark.issue:hover { filter: brightness(0.95); }
   cursor: pointer;
   font-size: 12.5px;
   color: #555;
-  transition: background 0.1s, border-color 0.1s;
 }
 .picker-chip:hover { background: #f0f4ff; border-color: #93b8f5; color: #1a1a1a; }
 .picker-chip-blank { border-style: dashed; }

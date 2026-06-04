@@ -18,8 +18,15 @@ export const checkStatus = () =>
 export const saveApiKey = (api_key) =>
   request('/api/setup', { method: 'POST', body: JSON.stringify({ api_key }) })
 
-export const analyzeText = (text, instructions, types, signal) =>
-  request('/api/analyze', { method: 'POST', body: JSON.stringify({ text, instructions, types }), signal })
+export const analyzeText = (
+  { target, context_before = '', context_after = '', mode = 'line', instructions = '', types = [] },
+  signal,
+) =>
+  request('/api/analyze', {
+    method: 'POST',
+    body: JSON.stringify({ target, context_before, context_after, mode, instructions, types }),
+    signal,
+  })
 
 export const sendChatMessage = (session_id, message, context) =>
   request('/api/chat', { method: 'POST', body: JSON.stringify({ session_id, message, context }) })

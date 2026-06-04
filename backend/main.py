@@ -30,9 +30,12 @@ class SetupRequest(BaseModel):
     api_key: str
 
 class AnalyzeRequest(BaseModel):
-    text: str
-    instructions: str           # assembled by the frontend from the active mode's checks
-    types: list[str]            # allowed type values for the LLM response
+    target: str
+    context_before: str = ""
+    context_after: str = ""
+    mode: str = "line"            # "line" | "structure"
+    instructions: str = ""        # assembled by the frontend; structure mode may leave blank
+    types: list[str] = []         # allowed type values for the LLM response
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -60,7 +63,14 @@ def analyze(req: AnalyzeRequest):
     if not get_api_key():
         raise HTTPException(status_code=401, detail="API key not configured")
     try:
-        issues = analyze_text(req.text, req.instructions, req.types)
+        issues = analyze_text(
+            target=req.target,
+            context_before=req.context_before,
+            context_after=req.context_after,
+            mode=req.mode,
+            instructions=req.instructions,
+            types_list=req.types,
+        )
         return {"issues": issues}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

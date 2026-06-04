@@ -16,7 +16,7 @@ def save_api_key(key: str) -> dict:
     try:
         client = genai.Client(api_key=key)
         client.models.generate_content(
-            model="gemini-3.5-flash",
+            model="gemini-2.5-flash",
             contents="hi",
             config={"max_output_tokens": 1},
         )
