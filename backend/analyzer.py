@@ -2,7 +2,14 @@ from google import genai
 from google.genai import types
 import json
 import uuid
+import time
 from config import get_api_key
+
+_RETRY_DELAYS = [5, 10]  # seconds between attempts for transient errors
+
+def _is_transient(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(tag in msg for tag in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'))
 
 LINE_SYSTEM_TEMPLATE = """\
 You are a writing assistant for a non-native English speaker pursuing a PhD.
@@ -103,15 +110,29 @@ def analyze_text(
         f"<context_after>\n{context_after}\n</context_after>"
     )
 
-    resp = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=payload,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=0.1,
-            response_mime_type="application/json",
-        ),
-    )
+    last_exc = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=payload,
+                config=types.GenerateContentConfig(
+                    system_instruction=system,
+                    temperature=0.1,
+                    response_mime_type="application/json",
+                ),
+            )
+            last_exc = None
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < len(_RETRY_DELAYS) and _is_transient(exc):
+                continue
+            raise
+    if last_exc:
+        raise last_exc
 
     data = json.loads(resp.text)
     issues = data.get("issues", [])

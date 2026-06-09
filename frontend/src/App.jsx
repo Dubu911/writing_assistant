@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { checkStatus, analyzeText } from './api'
 import { getAllModes, getModeById, assembleMode } from './modes'
 import SetupScreen from './components/SetupScreen'
@@ -6,6 +6,23 @@ import Editor from './components/Editor'
 import FeedbackPanel from './components/FeedbackPanel'
 import ModeEditor from './components/ModeEditor'
 import './App.css'
+
+// 10 s from first change → max ~6 calls/min, safely under Gemini 2.5 Flash free-tier 10 RPM
+const AUTO_DELAY = 10_000
+
+function cleanApiError(raw) {
+  // Extract the human-readable message from Python dict repr or JSON error blobs
+  const m = raw.match(/['"]message['"]\s*:\s*['"]([^'"]+)['"]/)
+  if (m) return m[1]
+  const dot = raw.indexOf('. {')
+  if (dot !== -1) return raw.slice(0, dot)
+  return raw
+}
+
+function isTransientError(msg) {
+  return msg.includes('503') || msg.includes('429') ||
+         msg.includes('UNAVAILABLE') || msg.includes('RESOURCE_EXHAUSTED')
+}
 
 function defaultFocusBand() {
   const h = window.innerHeight
@@ -24,12 +41,17 @@ export default function App() {
   const [apiError, setApiError]           = useState(null)
   const [showEditor, setShowEditor]       = useState(false)
   const [focusBand, setFocusBand]         = useState(() => defaultFocusBand())
+  const [autoAnalyze, setAutoAnalyze]     = useState(false)
 
-  const editorRef   = useRef(null)
-  const panelRef    = useRef(null)
-  const textRef     = useRef('')
-  const modeRef     = useRef(assembleMode(getModeById('basic')))
-  const abortRef    = useRef(null)
+  const editorRef        = useRef(null)
+  const editorColumnRef  = useRef(null)
+  const panelRef         = useRef(null)
+  const textRef          = useRef('')
+  const modeRef          = useRef(assembleMode(getModeById('basic')))
+  const abortRef         = useRef(null)
+  const autoAnalyzeRef   = useRef(false)
+  const autoTimerRef     = useRef(null)
+  const runAnalysisRef   = useRef(null)
 
   useEffect(() => {
     const mode = getModeById(activeModeId)
@@ -54,6 +76,15 @@ export default function App() {
     window.addEventListener('resize', onResize)
     return () => window.removeEventListener('resize', onResize)
   }, [])
+
+  // Snap focus band top to the actual top of the white page after mount
+  useLayoutEffect(() => {
+    if (!configured) return
+    const editorEl = editorColumnRef.current?.querySelector('.editor')
+    if (!editorEl) return
+    const top = Math.round(editorEl.getBoundingClientRect().top)
+    setFocusBand((b) => ({ ...b, top }))
+  }, [configured])
 
   // ── Analysis ──────────────────────────────────────────────────────────────
   const runAnalysis = useCallback(() => {
@@ -88,11 +119,24 @@ export default function App() {
       .then(({ issues: found }) => { if (!ctrl.signal.aborted) setIssues(found) })
       .catch((e) => {
         if (e.name === 'AbortError') return
+        if (ctrl.signal.aborted) return
         console.error('Analysis failed:', e)
-        if (!ctrl.signal.aborted) setApiError(e.message || 'Analysis failed')
+        const msg = e.message || 'Analysis failed'
+        if (isTransientError(msg) && autoAnalyzeRef.current && !autoTimerRef.current) {
+          autoTimerRef.current = setTimeout(() => {
+            autoTimerRef.current = null
+            runAnalysisRef.current?.()
+          }, AUTO_DELAY)
+          setApiError('API busy – retrying…')
+        } else {
+          setApiError(cleanApiError(msg))
+        }
       })
       .finally(() => { if (!ctrl.signal.aborted) setIsAnalyzing(false) })
   }, [feedbackMode])
+
+  // Keep runAnalysisRef current so the auto-timer closure never goes stale
+  useEffect(() => { runAnalysisRef.current = runAnalysis }, [runAnalysis])
 
   // Shift+Enter triggers analyze from anywhere
   useEffect(() => {
@@ -109,7 +153,25 @@ export default function App() {
   // ── Event handlers ────────────────────────────────────────────────────────
   const handleTextChange = useCallback((text) => {
     textRef.current = text
-  }, [])
+    if (autoAnalyzeRef.current && !autoTimerRef.current) {
+      autoTimerRef.current = setTimeout(() => {
+        autoTimerRef.current = null
+        runAnalysisRef.current?.()
+      }, AUTO_DELAY)
+    }
+  }, [])  // stable — reads only refs, no state deps
+
+  function toggleAutoAnalyze() {
+    setAutoAnalyze((prev) => {
+      const next = !prev
+      autoAnalyzeRef.current = next
+      if (!next) {
+        clearTimeout(autoTimerRef.current)
+        autoTimerRef.current = null
+      }
+      return next
+    })
+  }
 
   const handleApply = useCallback((issueText, suggestion) => {
     editorRef.current?.applyFix(issueText, suggestion)
@@ -170,6 +232,14 @@ export default function App() {
         )}
 
         <button
+          className={`auto-btn ${autoAnalyze ? 'active' : ''}`}
+          onClick={toggleAutoAnalyze}
+          title={autoAnalyze ? `Auto-analyze every ${AUTO_DELAY / 1000}s after first edit (click to disable)` : 'Enable auto-analyze'}
+        >
+          {autoAnalyze ? 'Auto' : 'Manual'}
+        </button>
+
+        <button
           className="analyze-btn"
           onClick={runAnalysis}
           disabled={isAnalyzing}
@@ -190,7 +260,7 @@ export default function App() {
       </header>
 
       <main className="workspace">
-        <div className="editor-column">
+        <div className="editor-column" ref={editorColumnRef}>
           <Editor
             ref={editorRef}
             issues={issues}
