@@ -19,14 +19,14 @@ export const saveApiKey = (api_key) =>
   request('/api/setup', { method: 'POST', body: JSON.stringify({ api_key }) })
 
 export const analyzeText = (
-  { target, context_before = '', context_after = '', mode = 'line', instructions = '', types = [] },
+  { target, context_before = '', context_after = '', mode = 'line', instructions = '', types = [], history = [], persona = '' },
   signal,
 ) =>
   request('/api/analyze', {
     method: 'POST',
-    body: JSON.stringify({ target, context_before, context_after, mode, instructions, types }),
+    body: JSON.stringify({ target, context_before, context_after, mode, instructions, types, history, persona }),
     signal,
   })
 
-export const sendChatMessage = (session_id, message, context) =>
-  request('/api/chat', { method: 'POST', body: JSON.stringify({ session_id, message, context }) })
+export const sendChatMessage = (session_id, message, context, persona = '') =>
+  request('/api/chat', { method: 'POST', body: JSON.stringify({ session_id, message, context, persona }) })

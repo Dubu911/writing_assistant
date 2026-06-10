@@ -3,7 +3,7 @@ from google.genai import types
 import json
 import uuid
 import time
-from config import get_api_key
+from config import get_api_key, MODEL_NAME
 
 _RETRY_DELAYS = [5, 10]  # seconds between attempts for transient errors
 
@@ -12,7 +12,7 @@ def _is_transient(exc: Exception) -> bool:
     return any(tag in msg for tag in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'))
 
 LINE_SYSTEM_TEMPLATE = """\
-You are a writing assistant for a non-native English speaker pursuing a PhD.
+{persona_line}
 
 You will receive THREE blocks of text:
   <context_before> ... </context_before>   (read-only background — DO NOT critique)
@@ -39,7 +39,7 @@ Rules:
 """
 
 STRUCTURE_SYSTEM_TEMPLATE = """\
-You are a structural editor for a non-native English speaker pursuing a PhD.
+{persona_line}
 
 You will receive THREE blocks of text:
   <context_before> ... </context_before>   (read-only background)
@@ -75,6 +75,53 @@ STRUCTURE_DEFAULT_INSTRUCTIONS = """\
 STRUCTURE_DEFAULT_TYPES = ["flow", "pacing", "organization", "transition", "coherence"]
 
 
+def _format_history_block(history: list[dict]) -> str:
+    """Render a 'previously reviewed' block. One line per sentence.
+    The model is told: don't re-flag unless the sentence is clearly still broken."""
+    lines = []
+    for entry in history:
+        sentence = entry.get("sentence", "").strip()
+        if not sentence:
+            continue
+        flag = entry.get("flag", "")
+        action = entry.get("action", "")
+        suggestion = (entry.get("suggestion") or "").strip()
+        if action == "accepted" and suggestion:
+            lines.append(
+                f'- Sentence: "{sentence}"\n'
+                f'  Previously flagged as {flag}; user already applied a fix. Treat as resolved unless still clearly broken.'
+            )
+        else:
+            lines.append(
+                f'- Sentence: "{sentence}"\n'
+                f'  Previously flagged as {flag}; user kept it as-is. Do NOT re-flag the same concern unless it is clearly still broken.'
+            )
+    if not lines:
+        return ""
+    return (
+        "\n\n<prior_reviews>\n"
+        "These sentences in <target> have been reviewed under the same criteria before.\n"
+        "Prefer silence over marginal repeat suggestions; only re-flag if the issue is clearly still present.\n\n"
+        + "\n".join(lines)
+        + "\n</prior_reviews>"
+    )
+
+
+def _persona_line(persona: str, mode: str) -> str:
+    """Opening sentence for the system prompt. Empty persona → neutral default.
+    User-set persona fully replaces the line; no PhD / non-native assumptions
+    are appended on top of it."""
+    p = (persona or "").strip()
+    if not p:
+        # Neutral defaults differ by mode so behavior matches the section's purpose.
+        return (
+            "You are a structural editor reviewing the user's writing."
+            if mode == "structure"
+            else "You are a writing assistant reviewing the user's writing."
+        )
+    return f"You are {p}."
+
+
 def analyze_text(
     target: str,
     context_before: str = "",
@@ -82,6 +129,8 @@ def analyze_text(
     mode: str = "line",
     instructions: str = "",
     types_list: list[str] | None = None,
+    history: list[dict] | None = None,
+    persona: str = "",
 ) -> list[dict]:
     key = get_api_key()
     if not key:
@@ -100,6 +149,7 @@ def analyze_text(
 
     client = genai.Client(api_key=key)
     system = system_template.format(
+        persona_line=_persona_line(persona, mode),
         instructions=instructions,
         types=json.dumps(types_list),
     )
@@ -109,6 +159,8 @@ def analyze_text(
         f"<target>\n{target}\n</target>\n\n"
         f"<context_after>\n{context_after}\n</context_after>"
     )
+    if mode == "line" and history:
+        payload += _format_history_block(history)
 
     last_exc = None
     for attempt, delay in enumerate([0] + _RETRY_DELAYS):
@@ -116,7 +168,7 @@ def analyze_text(
             time.sleep(delay)
         try:
             resp = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=MODEL_NAME,
                 contents=payload,
                 config=types.GenerateContentConfig(
                     system_instruction=system,

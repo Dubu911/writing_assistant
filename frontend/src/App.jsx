@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { checkStatus, analyzeText } from './api'
-import { getAllModes, getModeById, assembleMode } from './modes'
+import { getAllModes, getModeById, assembleMode, loadPersona, savePersona } from './modes'
 import SetupScreen from './components/SetupScreen'
 import Editor from './components/Editor'
 import FeedbackPanel from './components/FeedbackPanel'
@@ -9,6 +9,27 @@ import './App.css'
 
 // 10 s from first change → max ~6 calls/min, safely under Gemini 2.5 Flash free-tier 10 RPM
 const AUTO_DELAY = 10_000
+
+// Backoff delays (ms) used when an auto-analyze call hits a transient API error.
+// Indexed by retry attempt; clamps to the last value once exhausted.
+const RETRY_BACKOFF = [10_000, 20_000, 40_000]
+
+// Split text into sentences. Crude but adequate: split on .!? followed by whitespace.
+function splitSentences(text) {
+  if (!text) return []
+  return text
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+// Find the sentence in `target` that contains `snippet`.
+function findContainingSentence(target, snippet) {
+  for (const s of splitSentences(target)) {
+    if (s.includes(snippet)) return s
+  }
+  return null
+}
 
 function cleanApiError(raw) {
   // Extract the human-readable message from Python dict repr or JSON error blobs
@@ -24,6 +45,19 @@ function isTransientError(msg) {
          msg.includes('UNAVAILABLE') || msg.includes('RESOURCE_EXHAUSTED')
 }
 
+// Daily-quota exhaustion (free tier cap) won't recover from a 10–40s backoff —
+// it resets at midnight Pacific. Detect it so we stop retrying and show a
+// distinct, actionable message instead of pointlessly burning attempts.
+function isQuotaExhausted(msg) {
+  const lower = msg.toLowerCase()
+  return (
+    lower.includes('quota exceeded') ||
+    lower.includes('free_tier_requests') ||
+    lower.includes('per day') ||
+    lower.includes('perday')
+  )
+}
+
 function defaultFocusBand() {
   const h = window.innerHeight
   return { top: Math.round(h * 0.20), bottom: Math.round(h * 0.70) }
@@ -35,6 +69,7 @@ export default function App() {
   const [activeModeId, setActiveModeId]   = useState('basic')
   const [feedbackMode, setFeedbackMode]   = useState('line')  // 'line' | 'structure'
   const [issues, setIssues]               = useState([])
+  const [acknowledged, setAcknowledged]   = useState(() => new Set())
   const [hoveredIssueId, setHoveredIssueId] = useState(null)
   const [selectedIssueId, setSelectedIssueId] = useState(null)
   const [isAnalyzing, setIsAnalyzing]     = useState(false)
@@ -42,6 +77,7 @@ export default function App() {
   const [showEditor, setShowEditor]       = useState(false)
   const [focusBand, setFocusBand]         = useState(() => defaultFocusBand())
   const [autoAnalyze, setAutoAnalyze]     = useState(false)
+  const [persona, setPersona]             = useState(loadPersona)
 
   const editorRef        = useRef(null)
   const editorColumnRef  = useRef(null)
@@ -52,6 +88,18 @@ export default function App() {
   const autoAnalyzeRef   = useRef(false)
   const autoTimerRef     = useRef(null)
   const runAnalysisRef   = useRef(null)
+  // dirty = the user has made changes that have not yet produced a successful
+  // analyze response. Set on every edit, cleared on a successful response.
+  // While dirty + auto + transient error → keep retrying with backoff.
+  const dirtyRef         = useRef(false)
+  const retryAttemptRef  = useRef(0)
+
+  // sentence text → Map<type, { mode, modeId, flag, action, suggestion }>
+  // One slot per (sentence, type) so a sentence flagged for both clarity and
+  // word_choice carries both judgments forward. Without per-type slots, the
+  // last-written flag overwrites the prior one and the model has no record of
+  // it on the next call → flip-flopping. Session-only; cleared on reload.
+  const sentenceHistoryRef = useRef(new Map())
 
   useEffect(() => {
     const mode = getModeById(activeModeId)
@@ -105,6 +153,31 @@ export default function App() {
     setIsAnalyzing(true)
     setApiError(null)
 
+    // Build history payload: one entry per (sentence, type) judgment, where
+    // (a) the sentence is still present verbatim in the target, and
+    // (b) the judgment's type is one the current request is asking about.
+    // Edited sentences fall out automatically — the old sentence key won't be
+    // in the new target. A judgment for a type the user has turned off this
+    // round is also excluded; the model is free to look at that dimension fresh.
+    const history = []
+    if (feedbackMode === 'line') {
+      const currentTypes = new Set(types)
+      const targetSentences = new Set(splitSentences(snap.target))
+      for (const [sentence, perType] of sentenceHistoryRef.current) {
+        if (!targetSentences.has(sentence)) continue
+        for (const [type, entry] of perType) {
+          if (entry.mode !== 'line') continue
+          if (!currentTypes.has(type)) continue
+          history.push({
+            sentence,
+            flag: entry.flag,
+            action: entry.action,
+            suggestion: entry.suggestion,
+          })
+        }
+      }
+    }
+
     analyzeText(
       {
         target: snap.target,
@@ -113,27 +186,117 @@ export default function App() {
         mode: feedbackMode,
         instructions: feedbackMode === 'line' ? instructions : '',
         types: feedbackMode === 'line' ? types : [],
+        history,
+        persona,
       },
       ctrl.signal,
     )
-      .then(({ issues: found }) => { if (!ctrl.signal.aborted) setIssues(found) })
+      .then(({ issues: found }) => {
+        if (ctrl.signal.aborted) return
+        // Successful response: nothing to retry, no pending feedback owed.
+        dirtyRef.current = false
+        retryAttemptRef.current = 0
+        // Sticky-flag rule: an issue stays on screen until the user has
+        // acknowledged it (opened it, applied it, or edited the sentence away).
+        // New analyses can ADD issues but can't silently DROP unacknowledged ones.
+        setIssues((prev) => {
+          const ackd = acknowledged
+          const survivors = prev.filter((i) => {
+            if (ackd.has(i.id)) return false               // already dealt with
+            return snap.target.includes(i.text)            // sentence still present
+          })
+          // Dedup key prefers (containing-sentence, type) so the model rephrasing
+          // the span boundaries on the same sentence doesn't spawn a duplicate
+          // card. Falls back to (text, type) when the span doesn't map cleanly
+          // to one sentence (multi-sentence spans, splitter misses).
+          const keyFor = (text, type) => {
+            const sentence = findContainingSentence(snap.target, text)
+            return sentence
+              ? `s\x00${sentence}\x00${type}`
+              : `t\x00${text}\x00${type}`
+          }
+          const seen = new Set(survivors.map((i) => keyFor(i.text, i.type)))
+          const merged = [...survivors]
+          for (const issue of found) {
+            const key = keyFor(issue.text, issue.type)
+            if (seen.has(key)) continue
+            seen.add(key)
+            merged.push(issue)
+          }
+          // Prune acknowledged IDs that no longer correspond to any visible issue,
+          // so the set doesn't grow unboundedly during long sessions.
+          const visibleIds = new Set(merged.map((i) => i.id))
+          setAcknowledged((s) => {
+            let changed = false
+            const next = new Set()
+            for (const id of s) {
+              if (visibleIds.has(id)) next.add(id)
+              else changed = true
+            }
+            return changed ? next : s
+          })
+          return merged
+        })
+        // Record each flagged sentence in history, indexed by (sentence, type)
+        // so multiple flag types on the same sentence each carry forward.
+        if (feedbackMode === 'line') {
+          for (const issue of found) {
+            const sentence = findContainingSentence(snap.target, issue.text)
+            if (!sentence) continue
+            let perType = sentenceHistoryRef.current.get(sentence)
+            if (!perType) {
+              perType = new Map()
+              sentenceHistoryRef.current.set(sentence, perType)
+            }
+            perType.set(issue.type, {
+              mode: 'line',
+              modeId: activeModeId,
+              flag: issue.type,
+              action: 'flagged',
+              suggestion: issue.suggestions?.[0] ?? '',
+            })
+          }
+        }
+      })
       .catch((e) => {
         if (e.name === 'AbortError') return
         if (ctrl.signal.aborted) return
         console.error('Analysis failed:', e)
         const msg = e.message || 'Analysis failed'
-        if (isTransientError(msg) && autoAnalyzeRef.current && !autoTimerRef.current) {
+        // Daily-quota exhaustion: don't retry, quota resets at midnight PT.
+        if (isQuotaExhausted(msg)) {
+          retryAttemptRef.current = 0
+          dirtyRef.current = false
+          if (autoTimerRef.current) {
+            clearTimeout(autoTimerRef.current)
+            autoTimerRef.current = null
+          }
+          setApiError('Daily Gemini free quota exhausted — resets at midnight Pacific.')
+          return
+        }
+        // Transient + auto + still dirty → keep retrying with backoff until we
+        // get one successful response. This guarantees "every change gets at
+        // least one piece of feedback eventually."
+        const shouldRetry =
+          isTransientError(msg) &&
+          autoAnalyzeRef.current &&
+          dirtyRef.current &&
+          !autoTimerRef.current
+        if (shouldRetry) {
+          const idx = Math.min(retryAttemptRef.current, RETRY_BACKOFF.length - 1)
+          const delay = RETRY_BACKOFF[idx]
+          retryAttemptRef.current += 1
           autoTimerRef.current = setTimeout(() => {
             autoTimerRef.current = null
             runAnalysisRef.current?.()
-          }, AUTO_DELAY)
-          setApiError('API busy – retrying…')
+          }, delay)
+          setApiError(`API busy – retrying in ${Math.round(delay / 1000)}s…`)
         } else {
           setApiError(cleanApiError(msg))
         }
       })
       .finally(() => { if (!ctrl.signal.aborted) setIsAnalyzing(false) })
-  }, [feedbackMode])
+  }, [feedbackMode, activeModeId, acknowledged, persona])
 
   // Keep runAnalysisRef current so the auto-timer closure never goes stale
   useEffect(() => { runAnalysisRef.current = runAnalysis }, [runAnalysis])
@@ -153,6 +316,7 @@ export default function App() {
   // ── Event handlers ────────────────────────────────────────────────────────
   const handleTextChange = useCallback((text) => {
     textRef.current = text
+    dirtyRef.current = true
     if (autoAnalyzeRef.current && !autoTimerRef.current) {
       autoTimerRef.current = setTimeout(() => {
         autoTimerRef.current = null
@@ -168,6 +332,7 @@ export default function App() {
       if (!next) {
         clearTimeout(autoTimerRef.current)
         autoTimerRef.current = null
+        retryAttemptRef.current = 0
       }
       return next
     })
@@ -175,16 +340,66 @@ export default function App() {
 
   const handleApply = useCallback((issueText, suggestion) => {
     editorRef.current?.applyFix(issueText, suggestion)
-    setIssues((prev) => prev.filter((i) => i.text !== issueText))
+    setIssues((prev) => {
+      // We need the matched issue's type to mark only THAT (sentence, type)
+      // slot as accepted; sibling flags on the same sentence (different types)
+      // should keep their "flagged" status. Look it up before filtering.
+      const matched = prev.filter((i) => i.text === issueText)
+      if (matched.length) {
+        // Acknowledge each so the next analyze can't re-introduce them.
+        const droppedIds = matched.map((i) => i.id)
+        setAcknowledged((s) => {
+          const next = new Set(s)
+          for (const id of droppedIds) next.add(id)
+          return next
+        })
+        // Update sentence history: mark the accepted type, leave siblings.
+        // Then re-key the whole inner map to the post-edit sentence text so
+        // the next analyze's lookup (which uses the new sentence) finds it.
+        const oldSentence = findContainingSentence(textRef.current, issueText)
+        const perType = oldSentence ? sentenceHistoryRef.current.get(oldSentence) : null
+        if (oldSentence && perType) {
+          for (const issue of matched) {
+            const slot = perType.get(issue.type)
+            if (slot) perType.set(issue.type, { ...slot, action: 'accepted' })
+          }
+          const newSentence = oldSentence.replace(issueText, suggestion)
+          if (newSentence !== oldSentence) {
+            sentenceHistoryRef.current.delete(oldSentence)
+            sentenceHistoryRef.current.set(newSentence, perType)
+          }
+        }
+      }
+      return prev.filter((i) => i.text !== issueText)
+    })
   }, [])
 
   const handleIssueClick = useCallback((issueId) => {
-    setSelectedIssueId((prev) => (prev === issueId ? null : issueId))
+    // The panel calls this with `null` to collapse and with an id to (toggle-)expand.
+    // Treat a non-null id as an "opened" event for acknowledgement purposes.
+    setSelectedIssueId((prev) => {
+      if (issueId == null) return null
+      const opening = prev !== issueId
+      if (opening) {
+        setAcknowledged((s) => {
+          if (s.has(issueId)) return s
+          const next = new Set(s)
+          next.add(issueId)
+          return next
+        })
+      }
+      return opening ? issueId : null
+    })
   }, [])
 
   function handleModeSelect(id) {
     setAllModes(getAllModes())
     setActiveModeId(id)
+  }
+
+  function handlePersonaChange(next) {
+    setPersona(next)
+    savePersona(next)
   }
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -280,7 +495,7 @@ export default function App() {
           hoveredIssueId={hoveredIssueId}
           selectedIssueId={selectedIssueId}
           onHover={setHoveredIssueId}
-          onSelect={setSelectedIssueId}
+          onSelect={handleIssueClick}
           onApply={handleApply}
         />
       </main>
@@ -290,6 +505,8 @@ export default function App() {
           currentModeId={activeModeId}
           onClose={() => setShowEditor(false)}
           onSelectMode={handleModeSelect}
+          persona={persona}
+          onPersonaChange={handlePersonaChange}
         />
       )}
     </div>

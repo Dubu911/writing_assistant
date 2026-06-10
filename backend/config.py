@@ -5,6 +5,11 @@ from google import genai
 
 ENV_PATH = Path(__file__).parent.parent / ".env"
 
+# Single place to change the Gemini model. Flash-Lite has a far more generous
+# free-tier daily quota than Flash (the free tier caps Flash at ~20 req/day),
+# at the cost of somewhat weaker nuance on tone / structure feedback.
+MODEL_NAME = "gemini-2.5-flash-lite"
+
 
 def get_api_key() -> str | None:
     load_dotenv(ENV_PATH, override=True)
@@ -16,7 +21,7 @@ def save_api_key(key: str) -> dict:
     try:
         client = genai.Client(api_key=key)
         client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=MODEL_NAME,
             contents="hi",
             config={"max_output_tokens": 1},
         )

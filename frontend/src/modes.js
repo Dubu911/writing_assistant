@@ -1,6 +1,7 @@
 // modes.js — all mode/check definitions and localStorage persistence
 
-const STORAGE_KEY = 'wa_custom_modes'
+const STORAGE_KEY   = 'wa_custom_modes'
+const PERSONA_KEY   = 'wa_persona'
 
 // Check templates users can pick from when building a custom mode
 export const CHECK_TEMPLATES = [
@@ -58,6 +59,18 @@ export function loadCustomModes() {
 
 export function saveCustomModes(modes) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(modes))
+}
+
+// Persona — a one-line description of who the model should pretend to be.
+// Empty string = neutral writing assistant (backend default). Persists across
+// browser sessions.
+export function loadPersona() {
+  try { return localStorage.getItem(PERSONA_KEY) ?? '' }
+  catch { return '' }
+}
+
+export function savePersona(persona) {
+  localStorage.setItem(PERSONA_KEY, persona)
 }
 
 export function getAllModes() {

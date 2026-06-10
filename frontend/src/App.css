@@ -397,6 +397,10 @@ mark.issue.issue-selected {
   letter-spacing: 0.6px;
   color: #999;
 }
+.modal-sidebar-title-spaced {
+  margin-top: 16px;
+  border-top: 1px solid #eee;
+}
 .modal-mode-item {
   display: flex;
   align-items: center;

@@ -36,11 +36,14 @@ class AnalyzeRequest(BaseModel):
     mode: str = "line"            # "line" | "structure"
     instructions: str = ""        # assembled by the frontend; structure mode may leave blank
     types: list[str] = []         # allowed type values for the LLM response
+    history: list[dict] = []      # prior judgments for sentences in target, same criteria
+    persona: str = ""             # user-set persona; empty = neutral writing assistant
 
 class ChatRequest(BaseModel):
     session_id: str
     message: str
     context: dict  # { issue_text, issue_type, explanation, suggestions }
+    persona: str = ""
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -70,6 +73,8 @@ def analyze(req: AnalyzeRequest):
             mode=req.mode,
             instructions=req.instructions,
             types_list=req.types,
+            history=req.history,
+            persona=req.persona,
         )
         return {"issues": issues}
     except Exception as e:
@@ -81,7 +86,7 @@ def chat(req: ChatRequest):
     if not get_api_key():
         raise HTTPException(status_code=401, detail="API key not configured")
     try:
-        reply = send_message(req.session_id, req.message, req.context)
+        reply = send_message(req.session_id, req.message, req.context, req.persona)
         return {"reply": reply}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

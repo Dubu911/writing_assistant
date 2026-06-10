@@ -5,14 +5,17 @@ function uid() {
   return `c_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
 }
 
-export default function ModeEditor({ currentModeId, onClose, onSelectMode }) {
+const SETTINGS_ID = '__settings__'
+
+export default function ModeEditor({ currentModeId, onClose, onSelectMode, persona, onPersonaChange }) {
   const [customModes, setCustomModes] = useState(loadCustomModes)
   const [selectedId, setSelectedId]   = useState(currentModeId)
   const [showPicker, setShowPicker]   = useState(false)
 
   const allModes = [...BUILTIN_MODES, ...customModes]
-  const selected  = allModes.find((m) => m.id === selectedId) ?? allModes[0]
-  const isBuiltin = !!selected.builtin
+  const isSettings = selectedId === SETTINGS_ID
+  const selected  = isSettings ? null : (allModes.find((m) => m.id === selectedId) ?? allModes[0])
+  const isBuiltin = !!selected?.builtin
 
   // ── Persistence helpers ─────────────────────────────────────────────────────
 
@@ -94,7 +97,7 @@ export default function ModeEditor({ currentModeId, onClose, onSelectMode }) {
     <div className="modal-overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
       <div className="modal">
 
-        {/* Left sidebar — mode list */}
+        {/* Left sidebar — mode list + settings */}
         <aside className="modal-sidebar">
           <div className="modal-sidebar-title">Modes</div>
           {allModes.map((m) => (
@@ -108,9 +111,43 @@ export default function ModeEditor({ currentModeId, onClose, onSelectMode }) {
             </button>
           ))}
           <button className="modal-add-mode" onClick={addMode}>+ New Mode</button>
+
+          <div className="modal-sidebar-title modal-sidebar-title-spaced">Settings</div>
+          <button
+            className={`modal-mode-item ${isSettings ? 'active' : ''}`}
+            onClick={() => { setSelectedId(SETTINGS_ID); setShowPicker(false) }}
+          >
+            <span>Persona</span>
+          </button>
         </aside>
 
-        {/* Right panel — view / edit selected mode */}
+        {/* Right panel — settings or selected mode */}
+        {isSettings ? (
+          <div className="modal-body">
+            <div className="modal-header">
+              <div className="modal-title-row">
+                <h2 className="modal-mode-name">Persona</h2>
+                <div className="modal-actions">
+                  <button className="modal-close-btn" onClick={onClose}>×</button>
+                </div>
+              </div>
+              <p className="builtin-notice">
+                One sentence describing who the AI should pretend to be. Sent with every analyze and chat call. Leave empty for a neutral writing assistant. Saved automatically.
+              </p>
+            </div>
+            <div className="checks-list">
+              <div className="check-item">
+                <textarea
+                  className="check-instruction"
+                  value={persona ?? ''}
+                  rows={3}
+                  placeholder="e.g. an academic editor reviewing a PhD thesis for a non-native English speaker"
+                  onChange={(e) => onPersonaChange(e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+        ) : (
         <div className="modal-body">
           <div className="modal-header">
             <div className="modal-title-row">
@@ -216,6 +253,7 @@ export default function ModeEditor({ currentModeId, onClose, onSelectMode }) {
             </div>
           )}
         </div>
+        )}
       </div>
     </div>
   )
