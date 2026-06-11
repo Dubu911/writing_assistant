@@ -13,7 +13,8 @@ export default function ModeEditor({ currentModeId, onClose, onSelectMode, perso
   const [showPicker, setShowPicker]   = useState(false)
 
   const allModes = [...BUILTIN_MODES, ...customModes]
-  const isSettings = selectedId === SETTINGS_ID
+  const isPersonaSettings = selectedId === SETTINGS_ID
+  const isSettings = isPersonaSettings
   const selected  = isSettings ? null : (allModes.find((m) => m.id === selectedId) ?? allModes[0])
   const isBuiltin = !!selected?.builtin
 
@@ -114,7 +115,7 @@ export default function ModeEditor({ currentModeId, onClose, onSelectMode, perso
 
           <div className="modal-sidebar-title modal-sidebar-title-spaced">Settings</div>
           <button
-            className={`modal-mode-item ${isSettings ? 'active' : ''}`}
+            className={`modal-mode-item ${isPersonaSettings ? 'active' : ''}`}
             onClick={() => { setSelectedId(SETTINGS_ID); setShowPicker(false) }}
           >
             <span>Persona</span>
@@ -122,7 +123,7 @@ export default function ModeEditor({ currentModeId, onClose, onSelectMode, perso
         </aside>
 
         {/* Right panel — settings or selected mode */}
-        {isSettings ? (
+        {isPersonaSettings ? (
           <div className="modal-body">
             <div className="modal-header">
               <div className="modal-title-row">

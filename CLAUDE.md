@@ -62,8 +62,8 @@ If a sentence is only partially inside the focus window (its start or end falls 
 Auto mode debounces 10s from the first edit and fires one call per "burst of typing." The contract: **every edit must eventually produce at least one successful feedback round.** Concretely:
 
 - On every edit, a `dirty` flag is set. It clears only when an analyze call returns successfully.
-- If a call fails with a *transient* error (503, 429, UNAVAILABLE, RESOURCE_EXHAUSTED) while `dirty` is still true and auto is on, the next attempt is rescheduled with exponential backoff: 10s → 20s → 40s (capped). The status bar shows the countdown.
-- **Daily-quota exhaustion is treated separately from per-minute rate limits.** A `Quota exceeded` / `free_tier_requests` / `per day` error string tells us the quota won't recover from a 10–40s backoff — it resets at midnight Pacific. In that case we clear `dirty`, cancel the retry chain, and show a distinct message ("Daily Gemini free quota exhausted — resets at midnight Pacific.") instead of pointlessly burning more attempts.
+- If a call fails with a *transient* error while `dirty` is still true and auto is on, the next attempt is rescheduled with exponential backoff: 10s → 20s → 40s (capped). The status bar shows the countdown. Transient-error tags cover both providers: HTTP 429/500/502/503/504 (Cloudflare) and `UNAVAILABLE` / `RESOURCE_EXHAUSTED` (Gemini).
+- **Daily-quota exhaustion is treated separately from per-minute rate limits**, and the reset time depends on the active provider (see "Model provider" below). A `neuron` / `exceeded the daily` / `daily limit` / `quota exceeded` string (Cloudflare, resets midnight UTC) or `free_tier_requests` / `per day` string (Gemini, resets midnight Pacific) tells us the quota won't recover from a 10–40s backoff. In that case we clear `dirty`, cancel the retry chain, and show a provider-specific message ("Daily Cloudflare free quota exhausted — resets at midnight UTC." / "Daily Gemini free quota exhausted — resets at midnight Pacific.") instead of pointlessly burning more attempts. Note: the exact Cloudflare error string for daily exhaustion is unconfirmed — `isQuotaExhausted` in `App.jsx` uses best-effort matches and may need tuning once this is actually hit.
 - The retry counter resets to zero on any successful response or when auto is toggled off.
 - Hard errors (auth, malformed request) skip the retry path and surface immediately.
 
@@ -125,12 +125,22 @@ For now, keep it simple. Persistence will grow as the product does. Specifics wi
 
 ## Current backend surface
 
-FastAPI on `127.0.0.1:8000`. Model: `gemini-2.5-flash-lite` (centralised in `backend/config.py` as `MODEL_NAME`).
+FastAPI on `127.0.0.1:8000`. Four interchangeable LLM providers, selected per-request via the `provider` field (`"cloudflare"` | `"gemini"` | `"openai"` | `"anthropic"`, default `"cloudflare"`), each with a per-provider list of selectable models:
 
-The model was switched from `gemini-2.5-flash` to `flash-lite` because Google's free tier caps Flash at ~20 requests/day, which an auto-analyze writing session burns through in minutes. Flash-Lite has a much higher free daily quota. Trade-off: noticeably weaker on nuanced critique (tone, structural feedback). Acceptable for the line-mode grammar/clarity workflow the product centres on; structure mode quality is lower than it was on Flash.
+- **Cloudflare Workers AI (primary/default)** — `CF_MODELS` (`backend/config.py`): `@cf/meta/llama-3.1-8b-instruct-fp8` (default, cheaper) and `@cf/meta/llama-3.3-70b-instruct-fp8-fast` (stronger, costs more of the daily neuron budget). Requests go through `backend/cf_client.py` (`call_cloudflare`), a thin REST wrapper using OpenAI-style `messages` arrays and `response_format: {"type": "json_object"}` for the analyze call.
+- **Gemini (swappable)** — `GEMINI_MODELS`: `gemini-2.5-flash-lite` (default) and `gemini-2.5-flash`. Requests go through `backend/gemini_client.py` (`call_gemini`), which converts the same OpenAI-style `messages` array into Gemini's `system_instruction` + `contents` shape.
+- **OpenAI (swappable)** — `OPENAI_MODELS`: `gpt-4o-mini` (default) and `gpt-4o`. Requests go through `backend/openai_client.py` (`call_openai`), via the official `openai` SDK's Chat Completions API.
+- **Anthropic (swappable)** — `ANTHROPIC_MODELS`: `claude-haiku-4-5-20251001` (default) and `claude-sonnet-4-6`. Requests go through `backend/anthropic_client.py` (`call_anthropic`), via the official `anthropic` SDK's Messages API. Anthropic takes `system` as a separate top-level param (not in `messages`) and requires `max_tokens`; it has no native JSON mode, so `analyzer.py`'s `_parse_json_response` repair pass (strip ```` ```(json)? ```` fences, balanced-brace extraction) handles its fenced JSON output.
 
-- `GET  /api/status` — returns whether an API key is configured.
-- `POST /api/setup` — saves the user's Gemini API key.
+All four providers and their model lists live in `PROVIDER_MODELS` (`backend/config.py`), the single source of truth exposed to the frontend via `/api/status` so no model id is ever hardcoded client-side.
+
+`analyzer.py` and `chat.py` call whichever wrapper matches `provider` with an identical signature — `(creds_or_key, messages, *, model=None, json_mode=False, max_tokens=None, temperature=None)` — via a shared `_get_credentials(provider)` helper (Cloudflare returns an `(account_id, api_token)` tuple; the other three return a bare API-key string, or `None` if unconfigured). All raise `RuntimeError` carrying provider-native error text, so `_is_transient` (backend) and `isTransientError` / `isQuotaExhausted` / `cleanApiError` (frontend) pattern-match across all four vocabularies (Cloudflare/OpenAI/Anthropic HTTP codes 429/500/502/503/504, plus Anthropic's 529/`overloaded_error`; Gemini's `UNAVAILABLE` / `RESOURCE_EXHAUSTED` / `quota` / `free_tier_requests` / `per day`; OpenAI/Anthropic's `insufficient_quota` / `billing`, best-effort and unconfirmed).
+
+Cloudflare remains the default because Gemini's free tier caps both Flash and Flash-Lite at ~20 requests/day, which an auto-analyze writing session burns through in minutes, while Cloudflare's free tier is a 10,000-neuron/day budget (resets midnight UTC) that scales with request size — roughly 130-270 calls/day at this app's typical request size for the 8B model. OpenAI and Anthropic are paid-API-only (the user supplies their own billed key) — see "Model menu" below for how providers/models are selected and credentials managed. See PROGRESS.md for migration details and open follow-ups (fp8 JSON-mode reliability, exact Cloudflare daily-quota error string).
+
+- `GET  /api/status` — returns `{ configured, providers: { cloudflare, gemini, openai, anthropic }, models: PROVIDER_MODELS }`. `configured` mirrors `providers.cloudflare` (kept for compatibility; the frontend no longer gates rendering on it — see "Bootstrap" under "Model menu" below). `models` is `PROVIDER_MODELS` from `config.py`, letting the frontend populate the Model menu without hardcoding any model id.
+- `POST /api/setup` — body: `{ provider: "cloudflare" | "gemini" | "openai" | "anthropic", account_id, api_token, api_key }` (only the fields for the chosen provider matter). Cloudflare's `account_id`/`api_token` are validated with a live request before being persisted to `.env` as `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`; the other three providers' `api_key` is validated with a 1-token live request and persisted as `GEMINI_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`. Callable at any time, not just first-run — see "Model menu" below.
+- `GET  /api/credentials/{provider}` — returns the raw stored credential(s) for `provider` (`{ account_id, api_token }` for cloudflare, `{ api_key }` for the other three; empty strings if unconfigured) via `get_provider_credentials` (`backend/config.py`). Used by the Model menu to pre-fill the "Edit key" form so the user can view/copy their existing key. Local-only app (`127.0.0.1`), so returning raw secrets here is acceptable.
 - `POST /api/analyze` — body:
   ```
   {
@@ -141,15 +151,32 @@ The model was switched from `gemini-2.5-flash` to `flash-lite` because Google's 
     "instructions":   "...",   // line mode only
     "types":          [...],   // line mode only
     "history":        [...],   // line mode only; see "Revision memory" below
-    "persona":        "..."    // see "Persona" below; empty = neutral default
+    "persona":        "...",   // see "Persona" below; empty = neutral default
+    "provider":       "cloudflare" | "gemini" | "openai" | "anthropic",  // see "Model menu" below
+    "model":          "..."    // provider-specific model id; empty = provider default
   }
   ```
   Returns `{ issues: [...] }`. Each issue: `id`, `text` (verbatim substring of `target`), `type`, `explanation`, `suggestions[]`.
-- `POST /api/chat` — body: `{ session_id, message, context, persona }`. Returns `{ reply }`. (Currently unused by UI; kept for future "ask about this" feature.)
+- `POST /api/chat` — body: `{ session_id, message, context, persona, provider, model }`. Returns `{ reply }`. (Currently unused by UI; kept for future "ask about this" feature.)
 
 The analyzer wraps the three text blocks in `<context_before>`, `<target>`, `<context_after>` tags and instructs the model to critique only what's inside `<target>`. Issues whose `text` does not appear verbatim in the target are dropped server-side.
 
 Structure mode uses a different system prompt and default check list (flow, pacing, organization, transitions, coherence) and expects fewer, higher-level comments.
+
+---
+
+## Model menu
+
+A button in the top-left of the header opens the **Model menu** — an inline dropdown (not a modal) for picking the active provider, its model, and managing API credentials for all four providers. It replaces the old gear-icon "Model Provider" Settings tab.
+
+- **Provider + model.** `wa_provider` (`localStorage`) holds the active provider (`"cloudflare"` | `"gemini"` | `"openai"` | `"anthropic"`, default `"cloudflare"`); `wa_models` holds a per-provider model-id map (`{ cloudflare, gemini, openai, anthropic }`, defaults from `frontend/src/modes.js: DEFAULT_MODELS`, one-time-migrated from the legacy `wa_gemini_model` key). Both are sent on every `/api/analyze` and `/api/chat` call as `provider` and `model`. Clicking a model radio sets that provider's model AND switches the active provider to it — picking a model *is* picking its provider.
+- **Per-provider status + credentials.** Each provider's row in the menu shows a `configured` / `not configured` badge (from `/api/status`'s `providers` field) and an "Add key" / "Edit key" toggle that reveals an inline credential form (Cloudflare: Account ID + API Token; the other three: a single API key). Opening the form fetches the currently-stored value via `GET /api/credentials/{provider}` (`backend/config.py: get_provider_credentials`) and pre-fills the field(s), masked behind a "Show"/"Hide" toggle — lets the user copy their existing key (e.g. to set up the app on another machine) without retyping it. Saving calls `/api/setup`, then `refreshStatus()` re-fetches `/api/status` so badges and model radios update immediately — no restart needed. Credentials can be added or changed at any time, not just first-run.
+- **Disabled until configured.** Model radios for an unconfigured provider are disabled until a key is added.
+- **Provider-agnostic state.** `_sessions` in `chat.py` and `sentenceHistory` in the frontend are keyed independently of provider, so switching providers mid-session doesn't lose chat context or revision memory.
+
+### Bootstrap (no onboarding gate)
+
+The app always renders the main editor — there is no first-run setup screen. On mount, `App.jsx` calls `/api/status`; while `providerStatus` is `null` it shows a brief loading screen, then renders normally. If **no** provider is configured (`get_provider_status()` all-false), a persistent `.config-banner` appears above the header pointing the user at the Model menu to add at least one API key. It disappears as soon as any provider is configured (next `refreshStatus()` after a successful `/api/setup` call).
 
 ---
 
@@ -200,8 +227,8 @@ frontend/src/
     Editor.jsx            — contenteditable; paragraphs-as-<p>; snapshot capture
     FocusBand.jsx         — two viewport-fixed draggable pastel dotted lines
     FeedbackPanel.jsx     — right-margin card list, absolutely positioned to align with text
-    ModeEditor.jsx        — line-mode check editor (unchanged from before)
-    SetupScreen.jsx       — API key entry
+    ModeEditor.jsx        — line-mode check editor; Settings panel (persona)
+    ModelMenu.jsx         — top-left provider/model picker + inline credential forms
 ```
 
 ### How the focus snapshot works (line mode)

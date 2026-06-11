@@ -1,15 +1,38 @@
-from google import genai
-from google.genai import types
 import json
+import re
 import uuid
 import time
-from config import get_api_key, MODEL_NAME
+from config import (
+    get_cloudflare_credentials,
+    get_gemini_api_key,
+    get_openai_api_key,
+    get_anthropic_api_key,
+)
+from cf_client import call_cloudflare
+from gemini_client import call_gemini
+from openai_client import call_openai
+from anthropic_client import call_anthropic
 
 _RETRY_DELAYS = [5, 10]  # seconds between attempts for transient errors
 
 def _is_transient(exc: Exception) -> bool:
     msg = str(exc)
-    return any(tag in msg for tag in ('503', '429', 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'))
+    return any(tag in msg for tag in (
+        '429', '500', '502', '503', '504', '529',
+        'UNAVAILABLE', 'RESOURCE_EXHAUSTED', 'overloaded_error',
+    ))
+
+
+def _get_credentials(provider: str):
+    if provider == "cloudflare":
+        return get_cloudflare_credentials()
+    if provider == "gemini":
+        return get_gemini_api_key()
+    if provider == "openai":
+        return get_openai_api_key()
+    if provider == "anthropic":
+        return get_anthropic_api_key()
+    return None
 
 LINE_SYSTEM_TEMPLATE = """\
 {persona_line}
@@ -75,6 +98,38 @@ STRUCTURE_DEFAULT_INSTRUCTIONS = """\
 STRUCTURE_DEFAULT_TYPES = ["flow", "pacing", "organization", "transition", "coherence"]
 
 
+def _parse_json_response(raw: str) -> dict:
+    """Parse the model's raw text as JSON, with a text-cleanup repair pass
+    if the first attempt fails (strip markdown code fences, then extract the
+    first balanced {...} block)."""
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    cleaned = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw.strip(), flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find('{')
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(cleaned[start:], start):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(cleaned[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+
+    raise ValueError(f"Could not parse model response as JSON: {raw[:200]!r}")
+
+
 def _format_history_block(history: list[dict]) -> str:
     """Render a 'previously reviewed' block. One line per sentence.
     The model is told: don't re-flag unless the sentence is clearly still broken."""
@@ -131,9 +186,11 @@ def analyze_text(
     types_list: list[str] | None = None,
     history: list[dict] | None = None,
     persona: str = "",
+    provider: str = "cloudflare",
+    model: str = "",
 ) -> list[dict]:
-    key = get_api_key()
-    if not key:
+    creds = _get_credentials(provider)
+    if not creds:
         raise ValueError("API key not configured")
 
     if mode == "structure":
@@ -147,7 +204,6 @@ def analyze_text(
         if not types_list:
             types_list = ["grammar"]
 
-    client = genai.Client(api_key=key)
     system = system_template.format(
         persona_line=_persona_line(persona, mode),
         instructions=instructions,
@@ -162,20 +218,25 @@ def analyze_text(
     if mode == "line" and history:
         payload += _format_history_block(history)
 
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": payload},
+    ]
+
     last_exc = None
     for attempt, delay in enumerate([0] + _RETRY_DELAYS):
         if delay:
             time.sleep(delay)
         try:
-            resp = client.models.generate_content(
-                model=MODEL_NAME,
-                contents=payload,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.1,
-                    response_mime_type="application/json",
-                ),
-            )
+            if provider == "cloudflare":
+                account_id, api_token = creds
+                raw = call_cloudflare(account_id, api_token, messages, model=model or None, json_mode=True, max_tokens=2048, temperature=0.1)
+            elif provider == "gemini":
+                raw = call_gemini(creds, messages, model=model or None, json_mode=True, max_tokens=2048, temperature=0.1)
+            elif provider == "openai":
+                raw = call_openai(creds, messages, model=model or None, json_mode=True, max_tokens=2048, temperature=0.1)
+            else:
+                raw = call_anthropic(creds, messages, model=model or None, json_mode=True, max_tokens=2048, temperature=0.1)
             last_exc = None
             break
         except Exception as exc:
@@ -186,7 +247,7 @@ def analyze_text(
     if last_exc:
         raise last_exc
 
-    data = json.loads(resp.text)
+    data = _parse_json_response(raw)
     issues = data.get("issues", [])
 
     seen = set()

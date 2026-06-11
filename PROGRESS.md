@@ -18,32 +18,26 @@ Core app is functional end-to-end:
 - **Persona setting**: user-configurable one-line description of who the model should pretend to be. Stored in localStorage (`wa_persona`), persists across sessions, edited in a new Settings panel inside the mode editor. Empty default uses a neutral opener; set value fully replaces the old hardcoded "PhD / non-native" line. Decouples filter (mode) from voice (persona). See "Persona" in CLAUDE.md.
 - **Sticky flags**: an issue stays on screen until the user opens it, applies it, or edits the sentence away. New analyses merge with on-screen issues instead of replacing them. See "Sticky flags" in CLAUDE.md.
 - **Sentence revision memory** (line mode): per-(sentence, type) judgment history sent with each analyze call so the LLM doesn't flip-flop on unchanged text or shift goalposts after a fix. Multiple flag types on the same sentence each carry their own slot. Session-only, criteria-scoped, length-1 per `(sentence, type)`. See "Revision memory" in CLAUDE.md.
+- **Dual LLM provider with swap**: Cloudflare Workers AI (`@cf/meta/llama-3.1-8b-instruct-fp8`) is now the default provider; Gemini (`gemini-2.5-flash-lite`) is kept available as a one-click secondary via the new "Model Provider" Settings page. `backend/cf_client.py` and `backend/gemini_client.py` expose the same `call_*(…, json_mode, max_tokens, temperature)` signature; `analyzer.py`/`chat.py` dispatch on a per-request `provider` field. `/api/status` now returns `{ configured, providers: { cloudflare, gemini } }`. See "Model provider" and "Current backend surface" in CLAUDE.md.
+- **4-provider Model menu + onboarding gate removed**: added OpenAI (`backend/openai_client.py`, `gpt-4o-mini`/`gpt-4o`) and Anthropic (`backend/anthropic_client.py`, `claude-haiku-4-5-20251001`/`claude-sonnet-4-6`) as swappable providers, plus a Cloudflare 70B option (`@cf/meta/llama-3.3-70b-instruct-fp8-fast`). All 4 providers + their model lists live in `PROVIDER_MODELS` (`backend/config.py`), exposed via `/api/status`'s new `models` field. A new top-left **Model menu** (`frontend/src/components/ModelMenu.jsx`) replaces the old gear-icon "Model Provider" tab: pick provider+model via radios (sourced from `/api/status`, never hardcoded), and add/edit any provider's API key inline via `/api/setup` at any time — not just first run. `wa_gemini_model` localStorage key was replaced by a generic `wa_models` map (one model id per provider), with a one-time migration. The `gemini_model` request field became generic `model` on `/api/analyze`/`/api/chat`. `SetupScreen.jsx` and the onboarding gate are gone — the app always opens to the editor; if zero providers are configured, a `.config-banner` above the header points at the Model menu. See "Model menu" and "Current backend surface" in CLAUDE.md.
+  - **Caveat to verify with real keys**: the OpenAI/Anthropic/Cloudflare-70B model ids in `PROVIDER_MODELS` were chosen from current naming conventions but not live-tested against paid accounts yet. `/api/setup`'s live validation call will surface a clear "Invalid API key" or model-not-found error immediately if any id is stale — a one-line fix in `backend/config.py` if so.
+  - **Update**: cloudflare/gemini/openai model ids verified live against real keys via `/api/analyze` (all 3 returned valid responses or real provider errors); `anthropic` still unconfigured/unverified.
+- **View/copy stored API keys**: the Model menu's "Edit key" form now pre-fills with the currently-stored credential (via new `GET /api/credentials/{provider}` → `get_provider_credentials` in `backend/config.py`) behind a "Show"/"Hide" toggle, so the user can copy a key already configured on this machine to set up the app elsewhere. See "Model menu" and "Current backend surface" in CLAUDE.md.
 
 ---
 
 ## Open Issues
 
-### 1. Migrate LLM backend: Gemini → Cloudflare Workers AI  *(top priority)*
-**Problem:** Gemini's free tier on both `gemini-2.5-flash` AND `gemini-2.5-flash-lite` is capped at ~20 requests/day. A real auto-analyze writing session burns through that in minutes. Paying is not an option. Today's "switch to Flash-Lite" change did not actually solve this — both models share the same daily cap.
+### 1. ~~Migrate LLM backend: Gemini → Cloudflare Workers AI~~ — DONE (as dual-provider)
+**Was:** Gemini's free tier on both `gemini-2.5-flash` AND `gemini-2.5-flash-lite` is capped at ~20 requests/day. A real auto-analyze writing session burns through that in minutes.
 
-**Agreed approach:** Move LLM calls to **Cloudflare Workers AI** as the primary provider. Recommended models (in order):
-1. `@cf/google/gemma-4-26b-a4b-it` — primary, higher quality
-2. `@cf/meta/llama-3.1-8b-instruct-fp8-fast` — fallback, faster / cheaper neurons
+**Resolved by:** Cloudflare Workers AI (`@cf/meta/llama-3.1-8b-instruct-fp8`, ~10,000 neurons/day, resets midnight UTC) is now the **default** provider, reached via `backend/cf_client.py: call_cloudflare`. Rather than fully removing Gemini, it's kept as a **swappable secondary provider** (`backend/gemini_client.py: call_gemini`, `gemini-2.5-flash-lite`) — the user picks the active provider per-request from the new "Model Provider" Settings page (gear icon), and the choice is sent as `provider` on every `/api/analyze`/`/api/chat` call. `/api/status` now reports `{ configured, providers: { cloudflare, gemini } }` so the Settings page can show which providers are usable.
 
-**Why Cloudflare:** the only hosted free option whose limits comfortably exceed the workload (300 RPM, 10,000 neurons/day → ~450 calls/day on the 26B MoE model, ~600 on the 8B). Supports structured JSON output. No payment required.
+All prior work — sticky flags, per-(sentence, type) revision memory, retry-until-success, persona, quota-vs-rate classifier — is unchanged and works identically regardless of which provider is active; `_is_transient`/`isTransientError`/`isQuotaExhausted`/`cleanApiError` now match both providers' error vocabularies. See "Model provider" and "Current backend surface" in CLAUDE.md.
 
-**What this change touches:**
-- `backend/analyzer.py` and `backend/chat.py` — replace `google-genai` client + model calls with Cloudflare Workers AI HTTP calls. Different SDK/REST shape, different auth (API token instead of API key), different response format. Keep `MODEL_NAME` in `config.py` as the single source of truth (model id format will be `@cf/...`).
-- `backend/config.py` — `GEMINI_API_KEY` → `CLOUDFLARE_API_TOKEN` + `CLOUDFLARE_ACCOUNT_ID`. Two values, not one. Storage in `.env` stays the same idea.
-- `backend/main.py` — `/api/setup` and `/api/status` need to accept and validate the new credential pair.
-- `frontend/src/components/SetupScreen.jsx` — two input fields now (account id + token), help text pointing at the Cloudflare dashboard. Persona setting stays as-is.
-- **Keep all the work done today** — sticky flags, per-(sentence, type) history, retry-until-success, persona, quota-vs-rate classifier. All of it is provider-agnostic and only touches request/response plumbing at the edges. The `isQuotaExhausted` matcher needs Cloudflare-specific strings added.
-
-**Estimate:** ~1 focused session. Mostly mechanical replacement, but watch for: JSON Mode quirks (plan one repair-retry path), token-budget caps to keep output bounded, response_format schema differences vs Gemini.
-
-**Verify before coding:** open the Cloudflare Workers AI docs and confirm (a) the exact model IDs above still exist, (b) the published free-tier neuron allowance, (c) the JSON Schema response_format syntax. Don't trust quoted limits without checking.
-
-**Fallback plan if Cloudflare doesn't pan out:** local Ollama (`llama3.1:8b` or `qwen2.5:7b` Q4). Slower first-call, no quota ever, no data leaves the machine — matches the product principle. Requires user to install Ollama; treat as plan B.
+**Open follow-ups:**
+- ~~fp8 JSON-mode reliability~~ — RESOLVED. JSON-mode itself works fine on `@cf/meta/llama-3.1-8b-instruct-fp8` (the model wraps `{...}` in a "Here is the JSON object..." preamble + ` ``` ` fences, which `_parse_json_response`'s repair pass already strips). The real bug was that `analyze_text` called `call_cloudflare(...)` with no `max_tokens`, so Cloudflare's **default cap of 256 completion tokens** truncated the JSON mid-string before it could close — no repair pass can recover an unclosed object. Fixed by passing `max_tokens=2048` explicitly for both providers in `analyzer.py`. Verified live: a 3-issue response used 337/2048 tokens and parsed cleanly.
+- **Exact Cloudflare daily-neuron-exhaustion error string** is unconfirmed — `isQuotaExhausted` in `App.jsx` uses best-effort matches (`neuron`, `exceeded the daily`, `daily limit`, `quota exceeded`). Tune once the daily cap is actually hit.
 
 ---
 
@@ -60,7 +54,7 @@ Core app is functional end-to-end:
 - Keep the short, friendly message in the status bar.
 - Add an "Advanced" expandable section (or small dev panel) where the full last-error blob is accessible.
 **Files:** `App.jsx` (`cleanApiError`, the catch block in `runAnalysis`), possibly a new small `ErrorLog` or `DevPanel` component.
-**Defer until after** the Cloudflare migration — error strings will change shape, no point polishing the Gemini ones now.
+**Status:** still deferred — lower priority than other open work.
 
 ---
 
@@ -71,7 +65,7 @@ Core app is functional end-to-end:
 2. On save (or a dedicated button), send that description to a backend endpoint that asks the LLM to rewrite it as a precise, well-scoped instruction in the style of the existing built-in checks.
 3. Show the polished version to the user for confirmation before saving — user can accept, edit, or discard.
 **Files:** `ModeEditor.jsx` (UI for the polish step), `backend/main.py` (new `/api/polish-check` route), `backend/analyzer.py` or a new `backend/polish.py` (LLM call with a system prompt showing the existing check style as examples).
-**Defer until after** the Cloudflare migration.
+**Status:** still deferred — lower priority than other open work.
 
 ---
 
@@ -90,7 +84,7 @@ Core app is functional end-to-end:
 | Layer | Tech | Entry point |
 |---|---|---|
 | Backend | FastAPI + uvicorn | `backend/main.py` |
-| LLM calls | `google-genai` (Gemini 2.5 Flash-Lite — to be replaced by Cloudflare Workers AI; see Open Issue #1) | `backend/analyzer.py`, `backend/chat.py` |
+| LLM calls | Cloudflare Workers AI (default) + `google-genai` (Gemini, swappable secondary) | `backend/cf_client.py`, `backend/gemini_client.py`, dispatched from `backend/analyzer.py`, `backend/chat.py` |
 | Frontend | React 18 + Vite | `frontend/src/App.jsx` |
 | Modes/state | localStorage | `frontend/src/modes.js` |
 | API bridge | fetch via Vite proxy | `frontend/src/api.js` |

@@ -1,13 +1,15 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
 import { checkStatus, analyzeText } from './api'
-import { getAllModes, getModeById, assembleMode, loadPersona, savePersona } from './modes'
-import SetupScreen from './components/SetupScreen'
+import { getAllModes, getModeById, assembleMode, loadPersona, savePersona, loadProvider, saveProvider, loadModels, saveModel } from './modes'
 import Editor from './components/Editor'
 import FeedbackPanel from './components/FeedbackPanel'
 import ModeEditor from './components/ModeEditor'
+import ModelMenu from './components/ModelMenu'
 import './App.css'
 
-// 10 s from first change → max ~6 calls/min, safely under Gemini 2.5 Flash free-tier 10 RPM
+// 10 s from first change → max ~6 calls/min. Cloudflare's text-gen rate
+// limit is 300 RPM (vs Gemini's old 10 RPM) — 10s is now far more
+// conservative than necessary, but kept as-is; no functional change needed.
 const AUTO_DELAY = 10_000
 
 // Backoff delays (ms) used when an auto-analyze call hits a transient API error.
@@ -37,25 +39,57 @@ function cleanApiError(raw) {
   if (m) return m[1]
   const dot = raw.indexOf('. {')
   if (dot !== -1) return raw.slice(0, dot)
+  // Cloudflare errors come through as "Cloudflare API error <code>: <msg>" —
+  // strip the prefix and cap length in case the body is raw HTML.
+  const cf = raw.match(/^Cloudflare API error \d+:\s*(.+)$/s)
+  if (cf) return cf[1].slice(0, 200)
   return raw
 }
 
+// Covers all 4 providers: Cloudflare/OpenAI/Anthropic use HTTP status codes
+// (429/500/502/503/504, plus Anthropic's 529 "overloaded"), Gemini's SDK
+// errors carry UNAVAILABLE/RESOURCE_EXHAUSTED tags (often alongside a code).
 function isTransientError(msg) {
-  return msg.includes('503') || msg.includes('429') ||
-         msg.includes('UNAVAILABLE') || msg.includes('RESOURCE_EXHAUSTED')
+  return msg.includes('429') || msg.includes('500') ||
+         msg.includes('502') || msg.includes('503') || msg.includes('504') ||
+         msg.includes('529') ||
+         msg.includes('UNAVAILABLE') || msg.includes('RESOURCE_EXHAUSTED') ||
+         msg.toLowerCase().includes('overloaded')
 }
 
-// Daily-quota exhaustion (free tier cap) won't recover from a 10–40s backoff —
-// it resets at midnight Pacific. Detect it so we stop retrying and show a
+// Daily-quota exhaustion won't recover from a 10-40s backoff — Cloudflare's
+// 10,000 neurons/day free allowance resets at 00:00 UTC, Gemini's free tier
+// resets at midnight Pacific, and OpenAI/Anthropic billing caps don't reset
+// on any short timer either. Detect it so we stop retrying and show a
 // distinct, actionable message instead of pointlessly burning attempts.
+//
+// NOTE: Cloudflare's exact error code/message for daily neuron exhaustion is
+// unconfirmed — 'neuron'/'exceeded the daily'/'daily limit' are best-effort
+// matches against Cloudflare's general error vocabulary. The OpenAI/Anthropic
+// 'insufficient_quota'/'billing' matches are similarly best-effort. If the
+// real error doesn't match, it falls through to the transient-retry path (or
+// raw message via cleanApiError) instead; revisit once these are actually
+// hit in practice.
 function isQuotaExhausted(msg) {
   const lower = msg.toLowerCase()
   return (
+    lower.includes('neuron') ||
+    lower.includes('exceeded the daily') ||
+    lower.includes('daily limit') ||
     lower.includes('quota exceeded') ||
     lower.includes('free_tier_requests') ||
     lower.includes('per day') ||
-    lower.includes('perday')
+    lower.includes('perday') ||
+    lower.includes('insufficient_quota') ||
+    lower.includes('billing')
   )
+}
+
+const QUOTA_MESSAGES = {
+  cloudflare: 'Daily Cloudflare free quota exhausted — resets at midnight UTC.',
+  gemini: 'Daily Gemini free quota exhausted — resets at midnight Pacific.',
+  openai: 'OpenAI quota exceeded — check your plan and billing details.',
+  anthropic: 'Anthropic quota exceeded — check your plan and billing details.',
 }
 
 function defaultFocusBand() {
@@ -64,7 +98,6 @@ function defaultFocusBand() {
 }
 
 export default function App() {
-  const [configured, setConfigured]       = useState(null)
   const [allModes, setAllModes]           = useState(getAllModes)
   const [activeModeId, setActiveModeId]   = useState('basic')
   const [feedbackMode, setFeedbackMode]   = useState('line')  // 'line' | 'structure'
@@ -78,6 +111,10 @@ export default function App() {
   const [focusBand, setFocusBand]         = useState(() => defaultFocusBand())
   const [autoAnalyze, setAutoAnalyze]     = useState(false)
   const [persona, setPersona]             = useState(loadPersona)
+  const [provider, setProvider]           = useState(loadProvider)
+  const [providerStatus, setProviderStatus] = useState(null)
+  const [providerModels, setProviderModels] = useState({})
+  const [models, setModels]               = useState(loadModels)
 
   const editorRef        = useRef(null)
   const editorColumnRef  = useRef(null)
@@ -106,9 +143,16 @@ export default function App() {
     modeRef.current = assembleMode(mode)
   }, [activeModeId, allModes])
 
-  useEffect(() => {
-    checkStatus().then(({ configured }) => setConfigured(configured))
+  const refreshStatus = useCallback(() => {
+    checkStatus().then(({ providers, models: pm }) => {
+      if (providers) setProviderStatus(providers)
+      if (pm) setProviderModels(pm)
+    })
   }, [])
+
+  useEffect(() => {
+    refreshStatus()
+  }, [refreshStatus])
 
   // Keep focus band valid across window resizes
   useEffect(() => {
@@ -127,12 +171,12 @@ export default function App() {
 
   // Snap focus band top to the actual top of the white page after mount
   useLayoutEffect(() => {
-    if (!configured) return
+    if (!providerStatus) return
     const editorEl = editorColumnRef.current?.querySelector('.editor')
     if (!editorEl) return
     const top = Math.round(editorEl.getBoundingClientRect().top)
     setFocusBand((b) => ({ ...b, top }))
-  }, [configured])
+  }, [providerStatus])
 
   // ── Analysis ──────────────────────────────────────────────────────────────
   const runAnalysis = useCallback(() => {
@@ -188,6 +232,8 @@ export default function App() {
         types: feedbackMode === 'line' ? types : [],
         history,
         persona,
+        provider,
+        model: models[provider],
       },
       ctrl.signal,
     )
@@ -271,7 +317,7 @@ export default function App() {
             clearTimeout(autoTimerRef.current)
             autoTimerRef.current = null
           }
-          setApiError('Daily Gemini free quota exhausted — resets at midnight Pacific.')
+          setApiError(QUOTA_MESSAGES[provider] || 'Daily quota exhausted.')
           return
         }
         // Transient + auto + still dirty → keep retrying with backoff until we
@@ -296,7 +342,7 @@ export default function App() {
         }
       })
       .finally(() => { if (!ctrl.signal.aborted) setIsAnalyzing(false) })
-  }, [feedbackMode, activeModeId, acknowledged, persona])
+  }, [feedbackMode, activeModeId, acknowledged, persona, provider, models])
 
   // Keep runAnalysisRef current so the auto-timer closure never goes stale
   useEffect(() => { runAnalysisRef.current = runAnalysis }, [runAnalysis])
@@ -402,14 +448,40 @@ export default function App() {
     savePersona(next)
   }
 
+  function handleProviderChange(next) {
+    setProvider(next)
+    saveProvider(next)
+  }
+
+  function handleModelChange(providerId, modelId) {
+    setModels((m) => ({ ...m, [providerId]: modelId }))
+    saveModel(providerId, modelId)
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
-  if (configured === null) return <div className="loading">Loading…</div>
-  if (!configured) return <SetupScreen onComplete={() => setConfigured(true)} />
+  if (providerStatus === null) return <div className="loading">Loading…</div>
+
+  const noProviderConfigured = Object.values(providerStatus).every((v) => !v)
 
   return (
     <div className="app">
+      {noProviderConfigured && (
+        <div className="config-banner">
+          No LLM provider configured — open the model menu (top left) and add an API key for at least one provider to enable analysis.
+        </div>
+      )}
       <header className="app-header">
         <span className="app-title">Writing Assistant</span>
+
+        <ModelMenu
+          provider={provider}
+          onProviderChange={handleProviderChange}
+          models={models}
+          onModelChange={handleModelChange}
+          providerStatus={providerStatus}
+          providerModels={providerModels}
+          onCredentialsSaved={refreshStatus}
+        />
 
         <div className="feedback-mode-toggle">
           <button

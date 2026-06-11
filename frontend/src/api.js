@@ -15,18 +15,21 @@ async function request(path, options = {}) {
 export const checkStatus = () =>
   request('/api/status')
 
-export const saveApiKey = (api_key) =>
-  request('/api/setup', { method: 'POST', body: JSON.stringify({ api_key }) })
+export const saveApiKey = (payload) =>
+  request('/api/setup', { method: 'POST', body: JSON.stringify(payload) })
+
+export const getApiKey = (provider) =>
+  request(`/api/credentials/${provider}`)
 
 export const analyzeText = (
-  { target, context_before = '', context_after = '', mode = 'line', instructions = '', types = [], history = [], persona = '' },
+  { target, context_before = '', context_after = '', mode = 'line', instructions = '', types = [], history = [], persona = '', provider = 'cloudflare', model = '' },
   signal,
 ) =>
   request('/api/analyze', {
     method: 'POST',
-    body: JSON.stringify({ target, context_before, context_after, mode, instructions, types, history, persona }),
+    body: JSON.stringify({ target, context_before, context_after, mode, instructions, types, history, persona, provider, model }),
     signal,
   })
 
-export const sendChatMessage = (session_id, message, context, persona = '') =>
-  request('/api/chat', { method: 'POST', body: JSON.stringify({ session_id, message, context, persona }) })
+export const sendChatMessage = (session_id, message, context, persona = '', provider = 'cloudflare', model = '') =>
+  request('/api/chat', { method: 'POST', body: JSON.stringify({ session_id, message, context, persona, provider, model }) })

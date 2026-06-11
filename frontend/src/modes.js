@@ -2,6 +2,16 @@
 
 const STORAGE_KEY   = 'wa_custom_modes'
 const PERSONA_KEY   = 'wa_persona'
+const PROVIDER_KEY  = 'wa_provider'
+const MODELS_KEY    = 'wa_models'
+const LEGACY_GEMINI_MODEL_KEY = 'wa_gemini_model'
+
+const DEFAULT_MODELS = {
+  cloudflare: '@cf/meta/llama-3.1-8b-instruct-fp8',
+  gemini: 'gemini-2.5-flash-lite',
+  openai: 'gpt-4o-mini',
+  anthropic: 'claude-haiku-4-5-20251001',
+}
 
 // Check templates users can pick from when building a custom mode
 export const CHECK_TEMPLATES = [
@@ -71,6 +81,36 @@ export function loadPersona() {
 
 export function savePersona(persona) {
   localStorage.setItem(PERSONA_KEY, persona)
+}
+
+// Provider — which LLM backend serves /api/analyze and /api/chat.
+// "cloudflare" (default, primary) or "gemini" (secondary, swappable).
+// Persists across browser sessions.
+export function loadProvider() {
+  try { return localStorage.getItem(PROVIDER_KEY) ?? 'cloudflare' }
+  catch { return 'cloudflare' }
+}
+
+export function saveProvider(provider) {
+  localStorage.setItem(PROVIDER_KEY, provider)
+}
+
+// Models — per-provider model id map for /api/analyze and /api/chat, e.g.
+// { cloudflare: '...', gemini: '...', openai: '...', anthropic: '...' }.
+// Persists across browser sessions. Falls back to a one-time read of the
+// legacy single-provider Gemini key.
+export function loadModels() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(MODELS_KEY) || '{}')
+    const legacyGemini = localStorage.getItem(LEGACY_GEMINI_MODEL_KEY)
+    if (legacyGemini && !stored.gemini) stored.gemini = legacyGemini
+    return { ...DEFAULT_MODELS, ...stored }
+  } catch { return { ...DEFAULT_MODELS } }
+}
+
+export function saveModel(provider, modelId) {
+  const next = { ...loadModels(), [provider]: modelId }
+  localStorage.setItem(MODELS_KEY, JSON.stringify(next))
 }
 
 export function getAllModes() {

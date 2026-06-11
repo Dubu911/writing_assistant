@@ -1,9 +1,29 @@
-from google import genai
-from google.genai import types
-from config import get_api_key, MODEL_NAME
+from config import (
+    get_cloudflare_credentials,
+    get_gemini_api_key,
+    get_openai_api_key,
+    get_anthropic_api_key,
+)
+from cf_client import call_cloudflare
+from gemini_client import call_gemini
+from openai_client import call_openai
+from anthropic_client import call_anthropic
 
-# Store active chat sessions — resets on server restart, which is fine
-_sessions: dict[str, genai.chats.Chat] = {}
+
+def _get_credentials(provider: str):
+    if provider == "cloudflare":
+        return get_cloudflare_credentials()
+    if provider == "gemini":
+        return get_gemini_api_key()
+    if provider == "openai":
+        return get_openai_api_key()
+    if provider == "anthropic":
+        return get_anthropic_api_key()
+    return None
+
+# session_id -> list of {"role": ..., "content": ...} messages, starting with
+# the system message. In-memory, resets on server restart — fine.
+_sessions: dict[str, list[dict]] = {}
 
 SYSTEM_PROMPT = """\
 {persona_line}
@@ -29,25 +49,33 @@ def _persona_line(persona: str) -> str:
     return f"You are {p}."
 
 
-def send_message(session_id: str, message: str, context: dict, persona: str = "") -> str:
-    key = get_api_key()
-    client = genai.Client(api_key=key)
+def send_message(session_id: str, message: str, context: dict, persona: str = "", provider: str = "cloudflare", model: str = "") -> str:
+    creds = _get_credentials(provider)
+    if not creds:
+        raise ValueError("API key not configured")
 
     if session_id not in _sessions:
-        _sessions[session_id] = client.chats.create(
-            model=MODEL_NAME,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT.format(
-                    persona_line=_persona_line(persona),
-                    issue_text=context.get("issue_text", ""),
-                    issue_type=context.get("issue_type", "grammar"),
-                    explanation=context.get("explanation", ""),
-                    suggestions=", ".join(context.get("suggestions", [])),
-                ),
-                temperature=0.3,
-                max_output_tokens=300,
-            ),
+        system_prompt = SYSTEM_PROMPT.format(
+            persona_line=_persona_line(persona),
+            issue_text=context.get("issue_text", ""),
+            issue_type=context.get("issue_type", "grammar"),
+            explanation=context.get("explanation", ""),
+            suggestions=", ".join(context.get("suggestions", [])),
         )
+        _sessions[session_id] = [{"role": "system", "content": system_prompt}]
 
-    resp = _sessions[session_id].send_message(message)
-    return resp.text
+    history = _sessions[session_id]
+    history.append({"role": "user", "content": message})
+
+    if provider == "cloudflare":
+        account_id, api_token = creds
+        reply = call_cloudflare(account_id, api_token, history, model=model or None, max_tokens=300, temperature=0.3)
+    elif provider == "gemini":
+        reply = call_gemini(creds, history, model=model or None, max_tokens=300, temperature=0.3)
+    elif provider == "openai":
+        reply = call_openai(creds, history, model=model or None, max_tokens=300, temperature=0.3)
+    else:
+        reply = call_anthropic(creds, history, model=model or None, max_tokens=300, temperature=0.3)
+
+    history.append({"role": "assistant", "content": reply})
+    return reply
